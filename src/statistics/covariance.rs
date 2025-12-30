@@ -11,6 +11,9 @@ use super::quantile::compute_deciles;
 
 use rand::SeedableRng;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Result of covariance estimation including the matrix and diagnostics.
 #[derive(Debug, Clone)]
 pub struct CovarianceEstimate {
@@ -72,22 +75,29 @@ pub fn bootstrap_covariance_matrix(
     let n = data.len();
     let block_size = compute_block_size(n);
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-
-    // Storage for bootstrap quantile vectors
-    let mut bootstrap_vectors: Vec<Vector9> = Vec::with_capacity(n_bootstrap);
-
     // Generate bootstrap replicates
-    for _ in 0..n_bootstrap {
-        // Resample data
-        let resampled = block_bootstrap_resample(data, block_size, &mut rng);
+    #[cfg(feature = "parallel")]
+    let bootstrap_vectors: Vec<Vector9> = (0..n_bootstrap)
+        .into_par_iter()
+        .map(|i| {
+            // Each thread gets its own RNG seeded deterministically
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(i as u64));
+            let resampled = block_bootstrap_resample(data, block_size, &mut rng);
+            compute_deciles(&resampled)
+        })
+        .collect();
 
-        // Compute deciles for resampled data
-        let q = compute_deciles(&resampled);
-
-        // Store the quantile vector
-        bootstrap_vectors.push(q);
-    }
+    #[cfg(not(feature = "parallel"))]
+    let bootstrap_vectors: Vec<Vector9> = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut vectors = Vec::with_capacity(n_bootstrap);
+        for _ in 0..n_bootstrap {
+            let resampled = block_bootstrap_resample(data, block_size, &mut rng);
+            let q = compute_deciles(&resampled);
+            vectors.push(q);
+        }
+        vectors
+    };
 
     // Compute sample covariance matrix
     let cov_matrix = compute_sample_covariance(&bootstrap_vectors);

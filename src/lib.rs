@@ -9,6 +9,29 @@
 //! - CI gate pass/fail with bounded false positive rate
 //! - Exploitability assessment
 //!
+//! ## ⚠️ Common Pitfall: Side-Effects in Closures
+//!
+//! The closures you provide to `test()` must execute **identical code paths**.
+//! Only the input *data* should differ - not the operations performed.
+//!
+//! ```ignore
+//! // ❌ WRONG - Random closure has extra RNG/allocation overhead
+//! test(
+//!     || my_op(&[0u8; 32]),
+//!     || my_op(&rand::random()),  // RNG called during measurement!
+//! );
+//!
+//! // ✅ CORRECT - Pre-generate inputs, both closures identical
+//! use timing_oracle::helpers::InputPair;
+//! let inputs = InputPair::new([0u8; 32], || rand::random());
+//! test(
+//!     || my_op(&inputs.fixed()),
+//!     || my_op(&inputs.random()),
+//! );
+//! ```
+//!
+//! See the `helpers` module for utilities that make this pattern easier.
+//!
 //! ## Quick Start
 //!
 //! ```ignore
@@ -40,6 +63,7 @@ pub mod measurement;
 pub mod output;
 pub mod preflight;
 pub mod statistics;
+pub mod helpers;
 
 // Re-exports for public API
 pub use config::Config;
@@ -53,10 +77,30 @@ pub use result::{
 pub use ci::{CiFailure, CiRunOutcome, CiTestBuilder, FailCriterion, Mode};
 pub use types::{Class, Matrix9, Matrix9x2, Vector9};
 
+// Re-export helpers for convenience
+pub use helpers::InputPair;
+
 /// Convenience function for simple timing tests with default configuration.
 ///
 /// This runs a timing analysis comparing a fixed input operation against
 /// a random input operation.
+///
+/// # ⚠️ Critical Requirement
+///
+/// Both closures must execute **identical operations** - only the input data should differ.
+/// Never call RNG functions, allocate memory, or perform I/O inside the closures.
+///
+/// ```ignore
+/// // ❌ WRONG
+/// test(|| op(&FIXED), || op(&rand::random()));  // RNG overhead!
+///
+/// // ✅ CORRECT
+/// use timing_oracle::helpers::InputPair;
+/// let inputs = InputPair::new(FIXED, || rand::random());
+/// test(|| op(&inputs.fixed()), || op(&inputs.random()));
+/// ```
+///
+/// See `helpers::InputPair` for utilities to pre-generate inputs correctly.
 ///
 /// # Arguments
 ///

@@ -141,6 +141,8 @@ mod tests {
                 samples_per_class: 10000,
                 cycles_per_ns: 3.0,
                 timer: "rdtsc".to_string(),
+                timer_resolution_ns: 0.33,
+                iterations_per_sample: 1,
                 runtime_secs: 1.5,
             },
         }

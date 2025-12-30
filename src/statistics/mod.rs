@@ -14,4 +14,4 @@ mod quantile;
 pub use autocorrelation::{lag1_autocorrelation, lag2_autocorrelation};
 pub use bootstrap::{block_bootstrap_resample, compute_block_size};
 pub use covariance::{bootstrap_covariance_matrix, CovarianceEstimate};
-pub use quantile::{compute_deciles, compute_quantile};
+pub use quantile::{compute_deciles, compute_deciles_sorted, compute_quantile};

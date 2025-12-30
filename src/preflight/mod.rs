@@ -13,11 +13,13 @@
 
 mod autocorr;
 mod generator;
+mod resolution;
 mod sanity;
 mod system;
 
 pub use autocorr::{autocorrelation_check, AutocorrWarning};
 pub use generator::{generator_cost_check, measure_generator_cost, GeneratorWarning};
+pub use resolution::{resolution_check, ResolutionWarning};
 pub use sanity::{sanity_check, SanityWarning};
 pub use system::{system_check, SystemWarning};
 
@@ -73,12 +75,22 @@ impl PreflightResult {
         self.warnings.system.push(warning);
     }
 
+    /// Add a resolution warning.
+    pub fn add_resolution_warning(&mut self, warning: ResolutionWarning) {
+        if warning.is_critical() {
+            self.has_critical = true;
+            self.is_valid = false;
+        }
+        self.warnings.resolution.push(warning);
+    }
+
     /// Check if there are any warnings.
     pub fn has_warnings(&self) -> bool {
         !self.warnings.sanity.is_empty()
             || !self.warnings.generator.is_empty()
             || !self.warnings.autocorr.is_empty()
             || !self.warnings.system.is_empty()
+            || !self.warnings.resolution.is_empty()
     }
 }
 
@@ -96,6 +108,9 @@ pub struct PreflightWarnings {
 
     /// Warnings from system checks.
     pub system: Vec<SystemWarning>,
+
+    /// Warnings from timer resolution check.
+    pub resolution: Vec<ResolutionWarning>,
 }
 
 impl PreflightWarnings {

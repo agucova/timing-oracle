@@ -1,5 +1,6 @@
 //! Tests that must detect known timing leaks.
 
+use timing_oracle::helpers::InputPair;
 use timing_oracle::TimingOracle;
 
 /// Test that early-exit comparison is detected as leaky.
@@ -7,11 +8,15 @@ use timing_oracle::TimingOracle;
 fn detects_early_exit_comparison() {
     let secret = [0u8; 32];
 
+    // Pre-generate inputs using InputPair
+    const SAMPLES: usize = 100_000;
+    let inputs = InputPair::with_samples(SAMPLES, [0u8; 32], rand_bytes);
+
     let result = TimingOracle::new()
-        .samples(100_000)
+        .samples(SAMPLES)
         .test(
-            || early_exit_compare(&secret, &[0u8; 32]),
-            || early_exit_compare(&secret, &rand_bytes()),
+            || early_exit_compare(&secret, inputs.fixed()),
+            || early_exit_compare(&secret, inputs.random()),
         );
 
     assert!(
@@ -28,11 +33,19 @@ fn detects_early_exit_comparison() {
 /// Test that branch-based timing is detected.
 #[test]
 fn detects_branch_timing() {
+    // Pre-generate inputs using InputPair
+    const SAMPLES: usize = 100_000;
+    let inputs = InputPair::from_fn_with_samples(
+        SAMPLES,
+        || 0u8,
+        || rand::random::<u8>() | 1, // Never zero
+    );
+
     let result = TimingOracle::new()
-        .samples(100_000)
+        .samples(SAMPLES)
         .test(
-            || branch_on_zero(0),
-            || branch_on_zero(rand::random::<u8>() | 1), // Never zero
+            || branch_on_zero(*inputs.fixed()),
+            || branch_on_zero(*inputs.random()),
         );
 
     assert!(

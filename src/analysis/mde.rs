@@ -12,7 +12,6 @@
 //! 2. Fitting the effect model to each null sample
 //! 3. Taking the 95th percentile of |beta_hat| as the MDE
 
-use rand::Rng;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::result::MinDetectableEffect;
@@ -64,13 +63,25 @@ pub fn estimate_mde(
 ) -> MdeEstimate {
     let mut rng = rand::rng();
 
+    // Cache Cholesky decomposition (compute once, reuse for all samples)
+    let chol = match nalgebra::Cholesky::new(*covariance) {
+        Some(c) => c,
+        None => {
+            // Regularize if not positive definite
+            let regularized = covariance + Matrix9::identity() * 1e-10;
+            nalgebra::Cholesky::new(regularized)
+                .expect("Regularized covariance should be positive definite")
+        }
+    };
+
     // Collect effect estimates from null samples
     let mut shift_effects = Vec::with_capacity(n_simulations);
     let mut tail_effects = Vec::with_capacity(n_simulations);
 
     for _ in 0..n_simulations {
-        // Sample from null distribution
-        let null_sample = sample_null_mvn(covariance, &mut rng);
+        // Sample from null distribution using cached Cholesky
+        let z: Vector9 = Vector9::from_fn(|_, _| StandardNormal.sample(&mut rng));
+        let null_sample = chol.l() * z;
 
         // Fit effect model
         let decomp = decompose_effect(&null_sample, covariance, prior_sigmas);
@@ -91,29 +102,6 @@ pub fn estimate_mde(
     }
 }
 
-/// Sample from MVN(0, covariance/n_samples).
-///
-/// Uses the Cholesky decomposition: if L*L^T = Sigma, then
-/// L * z ~ MVN(0, Sigma) when z ~ N(0, I).
-fn sample_null_mvn<R: Rng>(covariance: &Matrix9, rng: &mut R) -> Vector9 {
-    // TODO: Cache Cholesky decomposition across samples for efficiency
-    let chol = match nalgebra::Cholesky::new(*covariance) {
-        Some(c) => c,
-        None => {
-            // Regularize if not positive definite
-            let regularized = covariance + Matrix9::identity() * 1e-10;
-            nalgebra::Cholesky::new(regularized)
-                .expect("Regularized covariance should be positive definite")
-        }
-    };
-
-    // Sample standard normal vector
-    let z: Vector9 = Vector9::from_fn(|_, _| StandardNormal.sample(rng));
-
-    // Transform: L * z
-    chol.l() * z
-}
-
 /// Compute the p-th percentile of a vector.
 ///
 /// Modifies the input vector by sorting it.
@@ -128,14 +116,6 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
     let idx = idx.min(values.len() - 1);
 
     values[idx]
-}
-
-/// Estimate MDE with default parameters.
-///
-/// Uses 1000 simulations and a weak prior (variance = 1e6).
-pub fn estimate_mde_default(covariance: &Matrix9) -> MdeEstimate {
-    let prior_sigmas = (1e3, 1e3);
-    estimate_mde(covariance, 1000, prior_sigmas)
 }
 
 #[cfg(test)]

@@ -1,0 +1,42 @@
+//! Demonstrates the new probability clamping behavior.
+//!
+//! This example shows how extremely obvious timing leaks now report 99.99%
+//! probability instead of 100%, staying philosophically sound.
+
+use timing_oracle::{TimingOracle, helpers::InputPair};
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    println!("Demonstrating probability clamping\n");
+
+    // Create an EXTREMELY obvious timing leak (1ms vs 0ms)
+    let inputs = InputPair::new(true, || false);
+
+    let result = TimingOracle::quick()
+        .test(
+            || {
+                if *inputs.fixed() {
+                    // Extremely obvious delay
+                    thread::sleep(Duration::from_micros(100));
+                }
+            },
+            || {
+                if *inputs.random() {
+                    thread::sleep(Duration::from_micros(100));
+                }
+            },
+        );
+
+    println!("Results for obvious timing leak (100μs difference):");
+    println!("  Leak probability: {:.2}%", result.leak_probability * 100.0);
+    println!("  CI gate passed: {}", result.ci_gate.passed);
+
+    if result.leak_probability >= 0.9999 {
+        println!("\n✓ Probability capped at 99.99% (not 100%)");
+        println!("  This represents overwhelming evidence while staying");
+        println!("  philosophically honest - we never claim P=1.0");
+    } else {
+        println!("\n  Probability: {:.4}", result.leak_probability);
+    }
+}

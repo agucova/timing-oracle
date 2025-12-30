@@ -95,6 +95,33 @@ pub fn compute_deciles(data: &[f64]) -> Vector9 {
     let mut sorted = data.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+    compute_deciles_sorted(&sorted)
+}
+
+/// Compute all 9 deciles from pre-sorted timing measurements.
+///
+/// This is an optimization when you need to compute deciles multiple times
+/// on the same data - sort once and reuse.
+///
+/// # Arguments
+///
+/// * `sorted` - Slice of timing measurements that MUST be sorted in ascending order
+///
+/// # Returns
+///
+/// A `Vector9` with decile values at positions 0-8 corresponding to
+/// quantiles 0.1-0.9.
+///
+/// # Panics
+///
+/// Panics if `sorted` is empty.
+///
+/// # Safety
+///
+/// The caller must ensure the data is sorted. No verification is performed.
+pub fn compute_deciles_sorted(sorted: &[f64]) -> Vector9 {
+    assert!(!sorted.is_empty(), "Cannot compute deciles of empty slice");
+
     let n = sorted.len();
     let mut result = Vector9::zeros();
 

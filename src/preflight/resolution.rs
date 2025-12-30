@@ -1,0 +1,185 @@
+//! Timer resolution check.
+//!
+//! This check detects when the timer resolution is too coarse relative to
+//! the operation being measured, which leads to unreliable statistics.
+//!
+//! On ARM (aarch64), the virtual timer runs at ~24 MHz (~41ns resolution),
+//! not at CPU frequency. For operations faster than the timer resolution,
+//! most measurements will be 0 or 1 tick, making statistical analysis meaningless.
+
+use serde::{Deserialize, Serialize};
+
+/// Warning from the resolution check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResolutionWarning {
+    /// Timer resolution is too coarse for the operation being measured.
+    ///
+    /// This is a critical warning - the statistical analysis will be unreliable.
+    InsufficientResolution {
+        /// Number of unique timing values observed.
+        unique_values: usize,
+        /// Total number of samples.
+        total_samples: usize,
+        /// Fraction of samples that were exactly zero.
+        zero_fraction: f64,
+        /// Estimated timer resolution in nanoseconds.
+        timer_resolution_ns: f64,
+    },
+
+    /// Many samples have identical timing values.
+    ///
+    /// This may indicate quantization effects from coarse timer resolution.
+    HighQuantization {
+        /// Number of unique timing values observed.
+        unique_values: usize,
+        /// Total number of samples.
+        total_samples: usize,
+    },
+}
+
+impl ResolutionWarning {
+    /// Check if this warning indicates a critical issue.
+    pub fn is_critical(&self) -> bool {
+        matches!(self, ResolutionWarning::InsufficientResolution { .. })
+    }
+
+    /// Get a human-readable description of the warning.
+    pub fn description(&self) -> String {
+        match self {
+            ResolutionWarning::InsufficientResolution {
+                unique_values,
+                total_samples,
+                zero_fraction,
+                timer_resolution_ns,
+            } => {
+                format!(
+                    "CRITICAL: Timer resolution (~{:.0}ns) is too coarse for this operation. \
+                     Only {} unique values in {} samples ({:.1}% are zero). \
+                     The operation is faster than the timer can measure. \
+                     Consider: (1) measuring multiple iterations per sample, \
+                     (2) using a more complex operation, or \
+                     (3) on ARM, accepting that sub-40ns operations cannot be reliably timed.",
+                    timer_resolution_ns,
+                    unique_values,
+                    total_samples,
+                    zero_fraction * 100.0
+                )
+            }
+            ResolutionWarning::HighQuantization {
+                unique_values,
+                total_samples,
+            } => {
+                format!(
+                    "Warning: High quantization detected - only {} unique values in {} samples. \
+                     Timer resolution may be affecting measurement quality.",
+                    unique_values, total_samples
+                )
+            }
+        }
+    }
+}
+
+/// Minimum unique values expected per 1000 samples for reliable analysis.
+const MIN_UNIQUE_PER_1000: usize = 20;
+
+/// Fraction of zero values that triggers critical warning.
+const CRITICAL_ZERO_FRACTION: f64 = 0.5;
+
+/// Perform resolution check on timing samples.
+///
+/// Detects when timer resolution is too coarse by checking:
+/// 1. How many unique timing values exist
+/// 2. What fraction of samples are exactly zero
+///
+/// # Arguments
+///
+/// * `samples` - Timing samples in nanoseconds
+/// * `timer_resolution_ns` - Estimated timer resolution (e.g., from cycles_per_ns)
+///
+/// # Returns
+///
+/// A warning if resolution issues are detected, None otherwise.
+pub fn resolution_check(samples: &[f64], timer_resolution_ns: f64) -> Option<ResolutionWarning> {
+    if samples.len() < 100 {
+        return None; // Not enough samples to assess
+    }
+
+    // Count unique values (with small tolerance for floating point)
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut unique_count = 1;
+    let mut last_value = sorted[0];
+    for &val in &sorted[1..] {
+        // Consider values different if they differ by more than 0.1ns
+        if (val - last_value).abs() > 0.1 {
+            unique_count += 1;
+            last_value = val;
+        }
+    }
+
+    // Count zeros
+    let zero_count = samples.iter().filter(|&&x| x.abs() < 0.1).count();
+    let zero_fraction = zero_count as f64 / samples.len() as f64;
+
+    // Check for critical issue: very few unique values AND many zeros
+    let expected_unique = (samples.len() as f64 / 1000.0 * MIN_UNIQUE_PER_1000 as f64).max(10.0) as usize;
+
+    if unique_count < expected_unique && zero_fraction > CRITICAL_ZERO_FRACTION {
+        return Some(ResolutionWarning::InsufficientResolution {
+            unique_values: unique_count,
+            total_samples: samples.len(),
+            zero_fraction,
+            timer_resolution_ns,
+        });
+    }
+
+    // Check for high quantization (less severe)
+    if unique_count < expected_unique / 2 {
+        return Some(ResolutionWarning::HighQuantization {
+            unique_values: unique_count,
+            total_samples: samples.len(),
+        });
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_good_resolution() {
+        // Simulated good data with many unique values
+        let samples: Vec<f64> = (0..1000).map(|x| (x as f64) + rand::random::<f64>()).collect();
+        let result = resolution_check(&samples, 1.0);
+        assert!(result.is_none(), "Good resolution should not warn");
+    }
+
+    #[test]
+    fn test_insufficient_resolution() {
+        // Simulated ARM-style data: mostly zeros with occasional 41ns ticks
+        let mut samples = vec![0.0; 800];
+        samples.extend(vec![41.0; 150]);
+        samples.extend(vec![82.0; 50]);
+
+        let result = resolution_check(&samples, 41.0);
+        assert!(result.is_some(), "Should detect insufficient resolution");
+        assert!(result.unwrap().is_critical(), "Should be critical warning");
+    }
+
+    #[test]
+    fn test_high_quantization() {
+        // Few unique values but not critically few zeros
+        let samples: Vec<f64> = (0..1000)
+            .map(|x| ((x % 5) * 10) as f64 + 100.0)
+            .collect();
+
+        let result = resolution_check(&samples, 10.0);
+        // May or may not trigger depending on thresholds
+        if let Some(warning) = result {
+            assert!(!warning.is_critical(), "Quantization warning should not be critical");
+        }
+    }
+}

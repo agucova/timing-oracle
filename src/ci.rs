@@ -69,7 +69,7 @@ pub enum CiFailure {
     /// Leak detected according to fail criterion.
     LeakDetected {
         /// Full run context when leak was detected.
-        outcome: CiRunOutcome,
+        outcome: Box<CiRunOutcome>,
     },
     /// Failed to write report to disk.
     ReportIo {
@@ -283,8 +283,6 @@ impl CiTestBuilder {
             async_workload,
         } = self;
 
-        let oracle = oracle;
-
         if let Some(seed) = seed {
             // TODO: plumb seed into measurement RNG when available.
             let _ = seed;
@@ -307,7 +305,7 @@ impl CiTestBuilder {
         write_report(&outcome)?;
 
         if should_fail(fail_on, &outcome.result) {
-            return Err(CiFailure::LeakDetected { outcome });
+            return Err(CiFailure::LeakDetected { outcome: Box::new(outcome) });
         }
 
         Ok(outcome)
@@ -333,6 +331,12 @@ impl CiTestBuilder {
         }
     }
 
+}
+
+impl Default for CiTestBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn compute_report_path(explicit: Option<&PathBuf>) -> Option<PathBuf> {
@@ -450,7 +454,7 @@ fn write_report(outcome: &CiRunOutcome) -> Result<(), CiFailure> {
     let file = fs::File::create(path)
         .map_err(|err| CiFailure::ReportIo { path: path.clone(), source: err })?;
     serde_json::to_writer_pretty(file, &report)
-        .map_err(|err| CiFailure::ReportIo { path: path.clone(), source: io::Error::new(io::ErrorKind::Other, err) })
+        .map_err(|err| CiFailure::ReportIo { path: path.clone(), source: io::Error::other(err) })
 }
 
 fn parse_mode_env(key: &str) -> Option<Mode> {

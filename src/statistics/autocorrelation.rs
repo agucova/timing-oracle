@@ -101,6 +101,7 @@ fn compute_lag_autocorrelation(data: &[f64], lag: usize) -> f64 {
 /// # Returns
 ///
 /// The autocorrelation coefficient of the interleaved sequence.
+#[cfg(test)]
 pub fn interleaved_autocorrelation(fixed: &[f64], random: &[f64], lag: usize) -> f64 {
     // Interleave the sequences: F0, R0, F1, R1, F2, R2, ...
     let n = fixed.len().min(random.len());
@@ -124,6 +125,7 @@ pub fn interleaved_autocorrelation(fixed: &[f64], random: &[f64], lag: usize) ->
 /// # Returns
 ///
 /// A vector of autocorrelation coefficients for lags 1 through max_lag.
+#[cfg(test)]
 pub fn autocorrelation_function(data: &[f64], max_lag: usize) -> Vec<f64> {
     (1..=max_lag)
         .map(|lag| compute_lag_autocorrelation(data, lag))
@@ -152,6 +154,7 @@ pub fn autocorrelation_function(data: &[f64], max_lag: usize) -> Vec<f64> {
 /// ```
 ///
 /// This is a first-order approximation assuming AR(1) dependence.
+#[cfg(test)]
 pub fn effective_sample_size(n: usize, rho1: f64) -> f64 {
     // Clamp rho1 to valid range to avoid division issues
     let rho1 = rho1.clamp(-0.99, 0.99);

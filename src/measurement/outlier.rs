@@ -142,6 +142,7 @@ fn compute_percentile(data: &mut [u64], percentile: f64) -> u64 {
     }
 }
 
+#[cfg(test)]
 /// Compute the threshold for outlier filtering without modifying the input.
 ///
 /// This is a non-destructive version that clones the data first.

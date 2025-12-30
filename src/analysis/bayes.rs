@@ -8,7 +8,7 @@
 use nalgebra::Cholesky;
 
 use crate::constants::{B_TAIL, LOG_2PI, ONES};
-use crate::types::{Matrix2, Matrix9, Matrix9x2, Vector2, Vector9};
+use crate::types::{Matrix2, Matrix9, Matrix9x2, Vector9};
 
 /// Result from Bayesian analysis.
 #[derive(Debug, Clone)]
@@ -17,6 +17,8 @@ pub struct BayesResult {
     pub log_bayes_factor: f64,
     /// Posterior probability of leak: P(H1|data)
     pub posterior_probability: f64,
+    /// Whether the posterior probability was clamped due to numerical limits.
+    pub is_clamped: bool,
     /// Null covariance used for inference.
     pub sigma0: Matrix9,
     /// Leak covariance used for inference.
@@ -48,11 +50,12 @@ pub fn compute_bayes_factor(
     let log_bf = mvn_log_pdf_zero(observed_diff, &sigma1)
         - mvn_log_pdf_zero(observed_diff, sigma0);
 
-    let posterior = compute_posterior_probability(log_bf, prior_no_leak);
+    let (posterior, is_clamped) = compute_posterior_probability(log_bf, prior_no_leak);
 
     BayesResult {
         log_bayes_factor: log_bf,
         posterior_probability: posterior,
+        is_clamped,
         sigma0: *sigma0,
         sigma1,
     }
@@ -61,18 +64,21 @@ pub fn compute_bayes_factor(
 /// Convert log Bayes factor to posterior probability.
 ///
 /// P(H1|data) = BF * prior_odds / (1 + BF * prior_odds)
-pub fn compute_posterior_probability(log_bf: f64, prior_no_leak: f64) -> f64 {
+///
+/// Returns (probability, is_clamped) where is_clamped indicates if the result
+/// hit numerical stability limits.
+pub fn compute_posterior_probability(log_bf: f64, prior_no_leak: f64) -> (f64, bool) {
     let prior_no_leak = prior_no_leak.clamp(1e-12, 1.0 - 1e-12);
     let prior_odds = (1.0 - prior_no_leak) / prior_no_leak;
 
     let log_posterior_odds = log_bf + prior_odds.ln();
 
     if log_posterior_odds > 700.0 {
-        1.0
+        (0.9999, true)
     } else if log_posterior_odds < -700.0 {
-        0.0
+        (0.0001, true)
     } else {
-        1.0 / (1.0 + (-log_posterior_odds).exp())
+        (1.0 / (1.0 + (-log_posterior_odds).exp()), false)
     }
 }
 
@@ -128,14 +134,30 @@ mod tests {
 
     #[test]
     fn test_posterior_probability_bounds() {
-        let prob_high = compute_posterior_probability(100.0, 0.5);
+        let (prob_high, clamped_high) = compute_posterior_probability(100.0, 0.5);
         assert!(prob_high > 0.999);
+        assert!(!clamped_high); // 100.0 is below the 700.0 threshold
 
-        let prob_low = compute_posterior_probability(-100.0, 0.5);
+        let (prob_low, clamped_low) = compute_posterior_probability(-100.0, 0.5);
         assert!(prob_low < 0.001);
+        assert!(!clamped_low);
 
-        let prob_equal = compute_posterior_probability(0.0, 0.5);
+        let (prob_equal, clamped_equal) = compute_posterior_probability(0.0, 0.5);
         assert!((prob_equal - 0.5).abs() < 0.001);
+        assert!(!clamped_equal);
+    }
+
+    #[test]
+    fn test_posterior_probability_clamping() {
+        // Test clamping at upper threshold
+        let (prob_clamped_high, clamped_high) = compute_posterior_probability(800.0, 0.5);
+        assert_eq!(prob_clamped_high, 0.9999);
+        assert!(clamped_high);
+
+        // Test clamping at lower threshold
+        let (prob_clamped_low, clamped_low) = compute_posterior_probability(-800.0, 0.5);
+        assert_eq!(prob_clamped_low, 0.0001);
+        assert!(clamped_low);
     }
 
     #[test]

@@ -47,6 +47,98 @@ if result.leak_probability > 0.9 {
 }
 ```
 
+## Common Mistakes
+
+### ❌ Don't Generate Random Data Inside Closures
+
+The most common mistake is calling RNG functions or allocating memory inside the measured closures:
+
+```rust
+// ❌ WRONG - RNG and allocation inside closure
+let result = test(
+    || encrypt(&KEY, &[0u8; 32]),
+    || {
+        let random_data: Vec<u8> = (0..32).map(|_| rand::random()).collect();
+        encrypt(&KEY, &random_data)  // Measures RNG + allocation + encrypt!
+    },
+);
+```
+
+**Why this fails:**
+- The random closure includes RNG overhead (~500+ cycles) + allocation
+- The fixed closure is just the encrypt operation
+- You're measuring RNG noise, not the encrypt timing difference
+- Weak timing leaks (<100ns) are drowned out by this noise
+
+**✅ Correct - Pre-generate all inputs:**
+
+```rust
+use timing_oracle::helpers::InputPair;
+
+// Pre-generate outside the closures
+let inputs = InputPair::new(
+    [0u8; 32],                    // Fixed: all zeros
+    || rand::random::<[u8; 32]>() // Random: generated once per sample
+);
+
+let result = test(
+    || encrypt(&KEY, &inputs.fixed()),
+    || encrypt(&KEY, &inputs.random()),
+);
+```
+
+Both closures now execute **identical code paths** - only the data differs.
+
+### Side-Effects to Avoid
+
+Inside measured closures, never:
+- Call `rand::random()` or any RNG functions
+- Allocate with `vec![]`, `Vec::new()`, `String::new()`, etc.
+- Perform I/O (file reads, network calls)
+- Use `println!()` or other logging
+- Access thread-locals or global state inconsistently
+
+All setup must happen **before** the closures are defined.
+
+## DudeCT Two-Class Pattern
+
+This library follows **DudeCT's two-class testing pattern** for detecting data-dependent timing:
+
+- **Class 0**: All-zero data (0x00 repeated)
+- **Class 1**: Random data
+
+This pattern tests whether operations have **data-dependent timing** rather than comparing specific fixed values:
+
+```rust
+use timing_oracle::TimingOracle;
+
+let result = TimingOracle::new()
+    .samples(50_000)
+    .test(
+        || {
+            // Class 0: All zeros
+            let data = [0u8; 32];
+            my_crypto_operation(&data)
+        },
+        || {
+            // Class 1: Random
+            let data = rand_bytes();
+            my_crypto_operation(&data)
+        },
+    );
+
+// Modern crypto should have Negligible exploitability even if timing differences detected
+if !result.ci_gate.passed {
+    assert!(matches!(result.exploitability, Exploitability::Negligible));
+}
+```
+
+**Why this pattern works:**
+- Simpler than fixed-vs-variable input patterns
+- Tests for data dependencies in crypto operations
+- Matches DudeCT's proven methodology
+- See `tests/aes_timing.rs` and `tests/ecc_timing.rs` for real-world examples
+
 ## Installation
 
 ```toml
@@ -60,18 +152,26 @@ timing-oracle = "0.1"
 cargo build                     # Build the library
 cargo test                      # Run all tests (unit + integration)
 cargo test --lib                # Run only unit tests
+
+# Integration tests
 cargo test --test known_leaky   # Run leak detection tests
 cargo test --test known_safe    # Run false-positive tests
 cargo test --test calibration   # Run statistical calibration tests
+cargo test --test aes_timing    # Run AES-128 encryption tests (DudeCT pattern)
+cargo test --test ecc_timing    # Run Curve25519 ECDH tests (DudeCT pattern)
+
+# Fast test execution
 cargo nextest run               # Faster test runner
 cargo nextest run --profile timing # Single-threaded timing profile
+
+# Performance optimization
 cargo build --features parallel # Enable rayon parallelism
 
 # Benchmarks (Criterion)
 cargo bench                    # Microbenchmarks of the timing pipeline (small sample sizes)
 ```
 
-**Note:** Integration tests (`known_leaky`, `known_safe`, `calibration`) use 100k samples and may take several minutes. Use `TimingOracle::quick()` during development for faster iteration.
+**Note:** Integration tests use 50k-100k samples and may take 2-5 minutes each. Use `TimingOracle::quick()` during development for faster iteration.
 
 If you're on Nix, `devenv shell` will bring in Rust toolchain + cargo-nextest/cargo-llvm-cov.
 
@@ -460,6 +560,51 @@ println!("Min detectable effect: {:.1} ns (shift), {:.1} ns (tail)",
          result.min_detectable_effect.shift_ns,
          result.min_detectable_effect.tail_ns);
 ```
+
+### Testing Async/Await Code
+
+For async functions, use `Runtime::block_on()` to bridge async → sync for measurement:
+
+```rust
+use timing_oracle::TimingOracle;
+use tokio::runtime::Runtime;
+use tokio::time::{sleep, Duration};
+
+// Create a runtime once per test
+let rt = tokio::runtime::Builder::new_current_thread()
+    .enable_time()
+    .build()
+    .unwrap();
+
+let result = TimingOracle::new()
+    .samples(10_000)
+    .test(
+        || {
+            rt.block_on(async {
+                // Fixed async operation
+                sleep(Duration::from_micros(10)).await;
+                std::hint::black_box(42)
+            })
+        },
+        || {
+            rt.block_on(async {
+                // Random async operation
+                sleep(Duration::from_micros(10)).await;
+                std::hint::black_box(43)
+            })
+        },
+    );
+
+// Verify no timing leak from async executor overhead
+assert!(result.ci_gate.passed, "Async executor overhead should be symmetric");
+```
+
+**Key considerations for async testing:**
+- Use **single-threaded** runtime for lower noise (`new_current_thread()`)
+- Create the runtime **once** outside the measured closures
+- Use `block_on()` to execute async code synchronously
+- Both closures should perform **identical async operations** for baseline tests
+- See `tests/async_timing.rs` for comprehensive async examples
 
 ## Troubleshooting
 

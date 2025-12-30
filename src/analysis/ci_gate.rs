@@ -14,6 +14,9 @@ use crate::result::CiGate;
 use crate::statistics::{block_bootstrap_resample, compute_block_size, compute_deciles};
 use crate::types::Vector9;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Input data for CI gate analysis.
 #[derive(Debug, Clone)]
 pub struct CiGateInput<'a> {
@@ -78,26 +81,48 @@ fn compute_bootstrap_thresholds(
     n_bootstrap: usize,
     seed: Option<u64>,
 ) -> Vector9 {
-    let mut rng = match seed {
-        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
-        None => rand::rngs::StdRng::seed_from_u64(42),
-    };
-
+    let base_seed = seed.unwrap_or(42);
     let n = fixed_samples.len().min(random_samples.len());
     let block_size = compute_block_size(n);
 
-    let mut fixed_diffs: Vec<Vector9> = Vec::with_capacity(n_bootstrap);
-    let mut random_diffs: Vec<Vector9> = Vec::with_capacity(n_bootstrap);
+    // Parallel bootstrap for both fixed and random classes
+    #[cfg(feature = "parallel")]
+    let (fixed_diffs, random_diffs): (Vec<Vector9>, Vec<Vector9>) = (0..n_bootstrap)
+        .into_par_iter()
+        .map(|i| {
+            // Each thread gets its own RNG seeded deterministically
+            let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
 
-    for _ in 0..n_bootstrap {
-        let f1 = block_bootstrap_resample(fixed_samples, block_size, &mut rng);
-        let f2 = block_bootstrap_resample(fixed_samples, block_size, &mut rng);
-        fixed_diffs.push(compute_deciles(&f1) - compute_deciles(&f2));
+            let f1 = block_bootstrap_resample(fixed_samples, block_size, &mut rng);
+            let f2 = block_bootstrap_resample(fixed_samples, block_size, &mut rng);
+            let fixed_diff = compute_deciles(&f1) - compute_deciles(&f2);
 
-        let r1 = block_bootstrap_resample(random_samples, block_size, &mut rng);
-        let r2 = block_bootstrap_resample(random_samples, block_size, &mut rng);
-        random_diffs.push(compute_deciles(&r1) - compute_deciles(&r2));
-    }
+            let r1 = block_bootstrap_resample(random_samples, block_size, &mut rng);
+            let r2 = block_bootstrap_resample(random_samples, block_size, &mut rng);
+            let random_diff = compute_deciles(&r1) - compute_deciles(&r2);
+
+            (fixed_diff, random_diff)
+        })
+        .unzip();
+
+    #[cfg(not(feature = "parallel"))]
+    let (fixed_diffs, random_diffs) = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed);
+        let mut fixed = Vec::with_capacity(n_bootstrap);
+        let mut random = Vec::with_capacity(n_bootstrap);
+
+        for _ in 0..n_bootstrap {
+            let f1 = block_bootstrap_resample(fixed_samples, block_size, &mut rng);
+            let f2 = block_bootstrap_resample(fixed_samples, block_size, &mut rng);
+            fixed.push(compute_deciles(&f1) - compute_deciles(&f2));
+
+            let r1 = block_bootstrap_resample(random_samples, block_size, &mut rng);
+            let r2 = block_bootstrap_resample(random_samples, block_size, &mut rng);
+            random.push(compute_deciles(&r1) - compute_deciles(&r2));
+        }
+
+        (fixed, random)
+    };
 
     let threshold_quantile = 1.0 - alpha;
     let idx = ((n_bootstrap as f64) * threshold_quantile).ceil() as usize;

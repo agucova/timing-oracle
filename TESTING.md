@@ -70,6 +70,186 @@ cargo test --test calibration
 
 **Runtime:** ~5-10 minutes (many trials with quick mode)
 
+#### Crypto Attacks (`tests/crypto_attacks.rs`)
+
+Real-world cryptographic timing vulnerabilities:
+
+```rust
+cargo test --test crypto_attacks
+```
+
+**Test Categories (20 tests total):**
+
+1. **Cache-Based Attacks (4 tests)**
+   - `aes_sbox_timing_fast` - AES S-box lookup timing (10k samples, ~15s)
+   - `aes_sbox_timing_thorough` - Thorough S-box test (100k samples, ~2-3 min) [ignored]
+   - `cache_line_boundary_effects` - Cache line access patterns
+   - `memory_access_pattern_leak` - Sequential vs random memory access
+
+2. **Modular Exponentiation (2 tests)**
+   - `modexp_square_and_multiply_timing` - Square-and-multiply with different Hamming weights (8k samples)
+   - `modexp_bit_pattern_timing` - Bit pattern timing differences
+
+3. **Table Lookup Timing (3 tests)**
+   - `table_lookup_small_l1` - L1-resident table (should show minimal timing)
+   - `table_lookup_medium_l2` - L2/L3 cache effects
+   - `table_lookup_large_cache_thrash` - Cache thrashing with 4KB table
+
+4. **Effect Pattern Validation (3 tests)** - x86_64/aarch64 only
+   - `effect_pattern_pure_uniform_shift` - Validates UniformShift classification
+   - `effect_pattern_pure_tail` - Validates TailEffect classification
+   - `effect_pattern_mixed` - Validates Mixed pattern classification
+
+5. **Exploitability Thresholds (4 tests)** - x86_64/aarch64 only
+   - `exploitability_negligible` - <100ns delays
+   - `exploitability_possible_lan` - 100-500ns delays
+   - `exploitability_likely_lan` - 500ns-20μs delays
+   - `exploitability_possible_remote` - >20μs delays
+
+**Expected:**
+- Leak detection tests: `leak_probability > 0.7-0.9`
+- Effect patterns match theoretical predictions
+- Exploitability classifications align with Crosby et al. thresholds
+
+**Runtime:**
+- Fast suite (~15 tests): 3-5 minutes
+- With ignored tests: 15-20 minutes total
+
+**Platform Notes:**
+- Effect pattern and exploitability tests require x86_64 or aarch64
+- Cache timing behavior varies by CPU architecture
+- Results may differ between Intel, AMD, and ARM processors
+
+#### Async Timing (`tests/async_timing.rs`)
+
+Async/await and concurrent task timing validation:
+
+```rust
+cargo test --test async_timing
+```
+
+**Test Categories (9 tests total):**
+
+1. **Baseline Tests (2 tests)** - Should pass, no false positives
+   - `async_executor_overhead_no_false_positive` - Symmetric executor overhead (10k samples)
+   - `async_block_on_overhead_symmetric` - Identical block_on() overhead (8k samples)
+
+2. **Leak Detection (3 tests)** - Should detect timing leaks
+   - `detects_conditional_await_timing` - Secret-dependent await (50k samples)
+   - `detects_early_exit_async` - Async early-return comparison (50k samples)
+   - `detects_secret_dependent_sleep` - Sleep duration varies with secret (100k samples) [ignored]
+
+3. **Concurrent Tasks (2 tests)**
+   - `concurrent_tasks_no_crosstalk` - Background tasks don't interfere (10k samples)
+   - `detects_task_spawn_timing_leak` - Different spawn counts (50k samples) [ignored]
+
+4. **Optional Thorough (2 tests)** - Informational [both ignored]
+   - `tokio_single_vs_multi_thread_stability` - Noise comparison between runtimes
+   - `async_workload_flag_effectiveness` - Flag behavior validation
+
+**Expected:**
+- Baseline: `ci_gate.passed == true`, `leak_probability < 0.5`
+- Leak detection: `leak_probability > 0.7-0.8`
+- Concurrent: No crosstalk from background tasks
+
+**Runtime:**
+- Fast suite (5 tests): 20-40 seconds
+- With ignored tests: 5-10 minutes total
+
+**Usage Pattern:**
+```rust
+let rt = tokio::runtime::Builder::new_current_thread()
+    .enable_time()
+    .build()
+    .unwrap();
+
+TimingOracle::new().test(
+    || rt.block_on(async_fixed_op()),
+    || rt.block_on(async_random_op())
+);
+```
+
+#### AES Timing (`tests/aes_timing.rs`)
+
+AES-128 encryption timing tests inspired by DudeCT's aes32 example:
+
+```rust
+cargo test --test aes_timing
+```
+
+**Test Categories (7 tests total):**
+
+All tests use **DudeCT's two-class pattern**:
+- **Class 0**: All-zero plaintexts/keys (0x00 repeated)
+- **Class 1**: Random plaintexts/keys
+
+1. **Block Encryption Tests (4 tests)**
+   - `aes128_block_encrypt_constant_time` - Basic encryption with zeros vs random (100k samples, ~60s)
+   - `aes128_different_keys_constant_time` - All-zero vs random key (50k samples)
+   - `aes128_multiple_blocks_constant_time` - 4 blocks cumulative timing (20k samples)
+   - `aes128_key_init_constant_time` - Key expansion timing (50k samples)
+
+2. **Comparative Tests (3 tests)**
+   - `aes128_hamming_weight_independence` - 0x00 vs 0xFF plaintexts (30k samples)
+   - `aes128_byte_pattern_independence` - Sequential vs reverse patterns (30k samples)
+
+**Expected:**
+- Modern AES implementations (with AES-NI) should be constant-time
+- May detect small timing differences but exploitability should be **Negligible**
+- Tests allow `!ci_gate.passed` but assert on `Exploitability::Negligible`
+
+**Runtime:**
+- Full suite: 2-3 minutes
+
+**Example Output:**
+```
+[aes128_block_encrypt_constant_time]
+  leak_probability: 0.142
+  ci_gate.passed: true
+  exploitability: Negligible
+```
+
+#### ECC Timing (`tests/ecc_timing.rs`)
+
+Curve25519/X25519 elliptic curve timing tests inspired by DudeCT's donna/donnabad examples:
+
+```rust
+cargo test --test ecc_timing
+```
+
+**Test Categories (8 tests total):**
+
+All tests use **DudeCT's two-class pattern**:
+- **Class 0**: All-zero scalars/basepoints (0x00 repeated)
+- **Class 1**: Random scalars/basepoints
+
+1. **Scalar Multiplication Tests (5 tests)**
+   - `x25519_scalar_mult_constant_time` - Basic scalar mult with zeros vs random (50k samples, ~45s)
+   - `x25519_different_basepoints_constant_time` - All-zero vs random basepoint (30k samples)
+   - `x25519_multiple_operations_constant_time` - 3 operations cumulative timing (10k samples)
+   - `x25519_scalar_clamping_constant_time` - Scalar clamping timing (20k samples)
+   - `x25519_ecdh_exchange_constant_time` - Full ECDH key exchange (15k samples)
+
+2. **Comparative Tests (2 tests)**
+   - `x25519_hamming_weight_independence` - 0x00 vs 0xFF scalars (20k samples)
+   - `x25519_byte_pattern_independence` - Sequential vs reverse patterns (20k samples)
+
+**Expected:**
+- Modern X25519 implementations (like x25519-dalek) should be constant-time
+- May detect small timing differences but exploitability should be **Negligible** or **PossibleLAN**
+- Tests allow `!ci_gate.passed` but assert on low exploitability
+
+**Runtime:**
+- Full suite: 2-3 minutes
+
+**Example Output:**
+```
+[x25519_scalar_mult_constant_time]
+  leak_probability: 0.089
+  ci_gate.passed: true
+  exploitability: Negligible
+```
+
 ## Running Tests
 
 ### Quick Iteration
@@ -78,8 +258,13 @@ cargo test --test calibration
 # Run only unit tests (fast)
 cargo test --lib
 
-# Run a specific integration test
+# Run a specific integration test file
+cargo test --test aes_timing
+cargo test --test ecc_timing
+
+# Run a specific test
 cargo test --test known_leaky detects_early_exit_comparison
+cargo test --test aes_timing aes128_block_encrypt_constant_time
 
 # Run with nextest (faster parallel execution)
 cargo nextest run

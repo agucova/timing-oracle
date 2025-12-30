@@ -42,6 +42,29 @@ pub struct Config {
 
     /// Optional deterministic seed for measurement randomness.
     pub measurement_seed: Option<u64>,
+
+    /// Iterations per timing sample (default: Auto).
+    ///
+    /// When set to `Auto`, the library detects timer resolution and
+    /// automatically batches iterations when needed (e.g., on Apple Silicon).
+    /// Set to a specific value to override auto-detection.
+    pub iterations_per_sample: IterationsPerSample,
+}
+
+/// Configuration for iterations per timing sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterationsPerSample {
+    /// Automatically detect based on timer resolution.
+    ///
+    /// On Apple Silicon (~41ns resolution), this will batch multiple
+    /// iterations per sample to ensure reliable timing data.
+    /// On x86 (~1ns resolution), this typically uses 1 iteration.
+    Auto,
+
+    /// Use exactly N iterations per sample.
+    ///
+    /// The measured time will be divided by N to get per-iteration timing.
+    Fixed(usize),
 }
 
 impl Default for Config {
@@ -52,13 +75,36 @@ impl Default for Config {
             ci_alpha: 0.01,
             min_effect_of_concern_ns: 10.0,
             effect_threshold_ns: None,
-            ci_bootstrap_iterations: 500,  // Reduced from 10,000 for practical runtime
-            cov_bootstrap_iterations: 200, // Reduced from 2,000 for practical runtime
+            ci_bootstrap_iterations: 100,  // Reduced from 500 for 5x speedup with minimal accuracy loss
+            cov_bootstrap_iterations: 50,  // Reduced from 200 for 4x speedup
             outlier_percentile: 0.999,
             prior_no_leak: 0.75,
             calibration_fraction: 0.3,
             max_duration_ms: None,
             measurement_seed: None,
+            iterations_per_sample: IterationsPerSample::Auto,
+        }
+    }
+}
+
+impl Default for IterationsPerSample {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl IterationsPerSample {
+    /// Resolve the iterations count for a given timer.
+    ///
+    /// For `Auto`, uses the timer's resolution to suggest iterations.
+    /// For `Fixed(n)`, returns `n`.
+    pub fn resolve(&self, timer: &crate::measurement::Timer) -> usize {
+        match self {
+            Self::Auto => {
+                // Target 10ns effective resolution for statistical reliability
+                timer.suggested_iterations(10.0)
+            }
+            Self::Fixed(n) => *n,
         }
     }
 }

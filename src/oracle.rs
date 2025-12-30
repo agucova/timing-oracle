@@ -42,6 +42,15 @@ pub struct TimingOracle {
     timer: Option<Timer>,
 }
 
+struct PipelineInputs {
+    fixed_cycles: Vec<u64>,
+    random_cycles: Vec<u64>,
+    interleaved_cycles: Vec<u64>,
+    fixed_gen_time_ns: Option<f64>,
+    random_gen_time_ns: Option<f64>,
+    iterations_per_sample: usize,
+}
+
 impl Default for TimingOracle {
     fn default() -> Self {
         Self::new()
@@ -65,8 +74,8 @@ impl TimingOracle {
     /// Settings:
     /// - 5,000 samples (vs 100,000 default)
     /// - 50 warmup iterations (vs 1,000 default)
-    /// - 50 covariance bootstrap iterations (vs 200 default)
-    /// - 50 CI bootstrap iterations (vs 500 default)
+    /// - 50 covariance bootstrap iterations (vs 50 default)
+    /// - 50 CI bootstrap iterations (vs 100 default)
     pub fn quick() -> Self {
         Self {
             config: Config {
@@ -74,6 +83,52 @@ impl TimingOracle {
                 warmup: 50,
                 cov_bootstrap_iterations: 50,
                 ci_bootstrap_iterations: 50,
+                ..Config::default()
+            },
+            timer: None,
+        }
+    }
+
+    /// Create with balanced configuration for production use.
+    ///
+    /// Faster than default while maintaining good statistical power.
+    /// Recommended for most timing tests where ~1-2 second runtime is acceptable.
+    ///
+    /// Settings:
+    /// - 20,000 samples (vs 100,000 default, 5x faster)
+    /// - 200 warmup iterations (vs 1,000 default)
+    /// - 50 covariance bootstrap iterations (same as updated default)
+    /// - 100 CI bootstrap iterations (same as updated default)
+    pub fn balanced() -> Self {
+        Self {
+            config: Config {
+                samples: 20_000,
+                warmup: 200,
+                cov_bootstrap_iterations: 50,
+                ci_bootstrap_iterations: 100,
+                ..Config::default()
+            },
+            timer: None,
+        }
+    }
+
+    /// Create with minimal configuration for calibration tests.
+    ///
+    /// Optimized for running many trials (100+) in calibration suites.
+    /// Uses minimum sample sizes that maintain statistical validity.
+    ///
+    /// Settings:
+    /// - 2,000 samples (minimal for valid statistics)
+    /// - 20 warmup iterations
+    /// - 20 covariance bootstrap iterations
+    /// - 30 CI bootstrap iterations
+    pub fn calibration() -> Self {
+        Self {
+            config: Config {
+                samples: 2_000,
+                warmup: 20,
+                cov_bootstrap_iterations: 20,
+                ci_bootstrap_iterations: 30,
                 ..Config::default()
             },
             timer: None,
@@ -198,6 +253,23 @@ impl TimingOracle {
 
     /// Run test with simple closures.
     ///
+    /// # ⚠️ Critical Requirement
+    ///
+    /// Both closures must execute **identical operations** - only the input data should differ.
+    /// Never call RNG functions, allocate memory, or perform I/O inside the closures.
+    ///
+    /// ```ignore
+    /// // ❌ WRONG
+    /// TimingOracle::new().test(|| op(&FIXED), || op(&rand::random()));  // RNG overhead!
+    ///
+    /// // ✅ CORRECT
+    /// use timing_oracle::helpers::InputPair;
+    /// let inputs = InputPair::new(FIXED, || rand::random());
+    /// TimingOracle::new().test(|| op(&inputs.fixed()), || op(&inputs.random()));
+    /// ```
+    ///
+    /// See `helpers::InputPair` for utilities to pre-generate inputs correctly.
+    ///
     /// # Arguments
     ///
     /// * `fixed` - Closure that executes the operation with a fixed input
@@ -214,7 +286,7 @@ impl TimingOracle {
         let start_time = Instant::now();
 
         // Step 1: Create timer (reuse if provided) and collector
-        let timer = self.timer.clone().unwrap_or_else(Timer::new);
+        let timer = self.timer.clone().unwrap_or_default();
         let collector = Collector::with_timer(timer.clone(), self.config.warmup);
 
         // Step 2: Collect timing samples with randomized interleaving
@@ -233,11 +305,14 @@ impl TimingOracle {
 
         // Run the analysis pipeline
         self.run_pipeline(
-            fixed_cycles,
-            random_cycles,
-            interleaved_cycles,
-            None,
-            None,
+            PipelineInputs {
+                fixed_cycles,
+                random_cycles,
+                interleaved_cycles,
+                fixed_gen_time_ns: None,
+                random_gen_time_ns: None,
+                iterations_per_sample: collector.iterations_per_sample(),
+            },
             &timer,
             start_time,
         )
@@ -306,7 +381,7 @@ impl TimingOracle {
         let mut state = setup();
 
         // Create timer (reuse if provided)
-        let timer = self.timer.clone().unwrap_or_else(Timer::new);
+        let timer = self.timer.clone().unwrap_or_default();
 
         // Pre-generate all inputs to avoid borrow conflicts
         let fixed_gen_start = Instant::now();
@@ -374,11 +449,14 @@ impl TimingOracle {
 
         // Run the analysis pipeline
         self.run_pipeline(
-            fixed_cycles,
-            random_cycles,
-            interleaved_cycles,
-            Some(fixed_gen_time_ns),
-            Some(random_gen_time_ns),
+            PipelineInputs {
+                fixed_cycles,
+                random_cycles,
+                interleaved_cycles,
+                fixed_gen_time_ns: Some(fixed_gen_time_ns),
+                random_gen_time_ns: Some(random_gen_time_ns),
+                iterations_per_sample: 1, // test_with_inputs doesn't use batching
+            },
             &timer,
             start_time,
         )
@@ -387,14 +465,18 @@ impl TimingOracle {
     /// Run the full analysis pipeline on collected samples.
     fn run_pipeline(
         &self,
-        fixed_cycles: Vec<u64>,
-        random_cycles: Vec<u64>,
-        interleaved_cycles: Vec<u64>,
-        fixed_gen_time_ns: Option<f64>,
-        random_gen_time_ns: Option<f64>,
+        inputs: PipelineInputs,
         timer: &Timer,
         start_time: Instant,
     ) -> TestResult {
+        let PipelineInputs {
+            fixed_cycles,
+            random_cycles,
+            interleaved_cycles,
+            fixed_gen_time_ns,
+            random_gen_time_ns,
+            iterations_per_sample,
+        } = inputs;
         // Step 3: Outlier filtering (pooled symmetric)
         let (filtered_fixed, filtered_random, outlier_stats) =
             filter_outliers(&fixed_cycles, &random_cycles, self.config.outlier_percentile);
@@ -488,6 +570,60 @@ impl TimingOracle {
         };
         let ci_gate = run_ci_gate(&ci_gate_input);
 
+        // Early termination: Skip expensive Bayesian analysis if CI gate passes with large margin
+        // Compute the maximum ratio of observed to threshold across all quantiles
+        let ci_margin = ci_gate
+            .observed
+            .iter()
+            .zip(&ci_gate.thresholds)
+            .map(|(obs, thresh)| {
+                if *thresh > 0.0 {
+                    obs.abs() / thresh
+                } else {
+                    0.0
+                }
+            })
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+
+        // If CI gate passed and all observations are < 50% of thresholds, declare safe without Bayes
+        if ci_gate.passed && ci_margin < 0.5 {
+            let runtime_secs = start_time.elapsed().as_secs_f64();
+            let timer_name = if cfg!(target_arch = "x86_64") {
+                "rdtsc"
+            } else if cfg!(target_arch = "aarch64") {
+                "cntvct_el0"
+            } else {
+                "Instant"
+            };
+
+            return TestResult {
+                leak_probability: 0.0,
+                effect: None,
+                exploitability: Exploitability::Negligible,
+                min_detectable_effect: MinDetectableEffect {
+                    shift_ns: mde_estimate.shift_ns,
+                    tail_ns: mde_estimate.tail_ns,
+                },
+                ci_gate: CiGate {
+                    alpha: ci_gate.alpha,
+                    passed: ci_gate.passed,
+                    thresholds: ci_gate.thresholds,
+                    observed: ci_gate.observed,
+                },
+                quality: MeasurementQuality::from_mde_ns(mde_estimate.shift_ns),
+                outlier_fraction: outlier_stats.outlier_fraction,
+                metadata: Metadata {
+                    samples_per_class: infer_fixed.len().min(infer_random.len()),
+                    cycles_per_ns: timer.cycles_per_ns(),
+                    timer: timer_name.to_string(),
+                    timer_resolution_ns: timer.resolution_ns(),
+                    iterations_per_sample,
+                    runtime_secs,
+                },
+            };
+        }
+
         // Step 10: Compute Bayes factor and posterior probability (Layer 2)
         let bayes_result =
             compute_bayes_factor(&delta_infer, &cov_estimate, prior_sigmas, self.config.prior_no_leak);
@@ -550,9 +686,11 @@ impl TimingOracle {
             quality,
             outlier_fraction: outlier_stats.outlier_fraction,
             metadata: Metadata {
-            samples_per_class: infer_fixed.len().min(infer_random.len()),
+                samples_per_class: infer_fixed.len().min(infer_random.len()),
                 cycles_per_ns: timer.cycles_per_ns(),
                 timer: timer_name.to_string(),
+                timer_resolution_ns: timer.resolution_ns(),
+                iterations_per_sample,
                 runtime_secs,
             },
         }

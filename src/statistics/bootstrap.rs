@@ -69,12 +69,11 @@ pub fn block_bootstrap_resample<R: Rng>(data: &[f64], block_size: usize, rng: &m
         let end = (start + block_size).min(n);
 
         // Add the block to our resampled data
-        for i in start..end {
-            if result.len() < n {
-                result.push(data[i]);
-            } else {
+        for &value in data.iter().take(end).skip(start) {
+            if result.len() >= n {
                 break;
             }
+            result.push(value);
         }
     }
 
@@ -97,6 +96,7 @@ pub fn block_bootstrap_resample<R: Rng>(data: &[f64], block_size: usize, rng: &m
 /// # Returns
 ///
 /// A tuple of (resampled_fixed, resampled_random) vectors.
+#[cfg(test)]
 pub fn stratified_block_bootstrap<R: Rng>(
     fixed_data: &[f64],
     random_data: &[f64],

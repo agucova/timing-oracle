@@ -9,9 +9,8 @@
 
 use crate::types::Class;
 use rand::seq::SliceRandom;
-use rand::Rng;
 
-use super::timer::{black_box, Timer};
+use super::timer::{black_box, rdtsc, Timer};
 
 /// A single timing measurement sample.
 #[derive(Debug, Clone, Copy)]
@@ -39,28 +38,56 @@ pub struct Collector {
     timer: Timer,
     /// Number of warmup iterations to run before measuring.
     warmup_iterations: usize,
+    /// Iterations per sample for batched measurement.
+    iterations_per_sample: usize,
 }
 
 impl Collector {
     /// Create a new collector with the given warmup iterations.
+    ///
+    /// Uses auto-detected iterations per sample based on timer resolution.
     pub fn new(warmup_iterations: usize) -> Self {
+        let timer = Timer::new();
+        let iterations_per_sample = timer.suggested_iterations(10.0);
         Self {
-            timer: Timer::new(),
+            timer,
             warmup_iterations,
+            iterations_per_sample,
         }
     }
 
     /// Create a collector with a pre-calibrated timer.
+    ///
+    /// Uses auto-detected iterations per sample based on timer resolution.
     pub fn with_timer(timer: Timer, warmup_iterations: usize) -> Self {
+        let iterations_per_sample = timer.suggested_iterations(10.0);
         Self {
             timer,
             warmup_iterations,
+            iterations_per_sample,
+        }
+    }
+
+    /// Create a collector with explicit iterations per sample.
+    ///
+    /// Use this to override auto-detection when you know the expected
+    /// operation duration or want to force batching.
+    pub fn with_iterations(timer: Timer, warmup_iterations: usize, iterations_per_sample: usize) -> Self {
+        Self {
+            timer,
+            warmup_iterations,
+            iterations_per_sample: iterations_per_sample.max(1),
         }
     }
 
     /// Get a reference to the internal timer.
     pub fn timer(&self) -> &Timer {
         &self.timer
+    }
+
+    /// Get the number of iterations per sample.
+    pub fn iterations_per_sample(&self) -> usize {
+        self.iterations_per_sample
     }
 
     /// Run warmup iterations for both functions.
@@ -85,6 +112,9 @@ impl Collector {
     /// 2. Creates a randomized schedule alternating Fixed/Random
     /// 3. Measures each execution and records the timing
     ///
+    /// When `iterations_per_sample > 1` (auto-detected on Apple Silicon),
+    /// each sample measures multiple iterations and reports per-iteration cycles.
+    ///
     /// # Arguments
     ///
     /// * `samples_per_class` - Number of samples to collect for each class
@@ -108,15 +138,42 @@ impl Collector {
         // Collect measurements
         let mut samples = Vec::with_capacity(samples_per_class * 2);
 
-        for class in schedule {
-            let cycles = match class {
-                Class::Fixed => self.timer.measure_cycles(&mut fixed),
-                Class::Random => self.timer.measure_cycles(&mut random),
-            };
-            samples.push(Sample::new(class, cycles));
+        if self.iterations_per_sample <= 1 {
+            // Single-iteration measurement (x86 or when explicitly set)
+            for class in schedule {
+                let cycles = match class {
+                    Class::Fixed => self.timer.measure_cycles(&mut fixed),
+                    Class::Random => self.timer.measure_cycles(&mut random),
+                };
+                samples.push(Sample::new(class, cycles));
+            }
+        } else {
+            // Batched measurement (Apple Silicon auto-detection)
+            let iters = self.iterations_per_sample;
+            for class in schedule {
+                let cycles = match class {
+                    Class::Fixed => self.measure_batched(&mut fixed, iters),
+                    Class::Random => self.measure_batched(&mut random, iters),
+                };
+                samples.push(Sample::new(class, cycles));
+            }
         }
 
         samples
+    }
+
+    /// Measure a batch of iterations and return per-iteration cycles.
+    #[inline]
+    fn measure_batched<F, T>(&self, f: &mut F, iterations: usize) -> u64
+    where
+        F: FnMut() -> T,
+    {
+        let start = rdtsc();
+        for _ in 0..iterations {
+            black_box(f());
+        }
+        let end = rdtsc();
+        end.saturating_sub(start) / iterations as u64
     }
 
     /// Create a randomized interleaved measurement schedule.
@@ -175,17 +232,6 @@ impl Default for Collector {
     fn default() -> Self {
         Self::new(1000)
     }
-}
-
-/// Create a randomized interleaved schedule without collecting samples.
-///
-/// Useful for testing or custom measurement loops.
-pub fn create_interleaved_schedule<R: Rng>(rng: &mut R, samples_per_class: usize) -> Vec<Class> {
-    let mut schedule: Vec<Class> = Vec::with_capacity(samples_per_class * 2);
-    schedule.extend(std::iter::repeat(Class::Fixed).take(samples_per_class));
-    schedule.extend(std::iter::repeat(Class::Random).take(samples_per_class));
-    schedule.shuffle(rng);
-    schedule
 }
 
 #[cfg(test)]

@@ -1,25 +1,35 @@
 //! Simple example demonstrating basic timing-oracle usage.
+//!
+//! This demonstrates the CORRECT way to test operations:
+//! - Pre-generate all inputs before measurement
+//! - Both closures execute identical code paths
+//! - Only the input data differs
 
-use timing_oracle::{test, TimingOracle};
+use timing_oracle::{test, helpers::InputPair, TimingOracle};
 
 fn main() {
     println!("timing-oracle simple example\n");
 
     // Example: Testing a potentially leaky comparison
     let secret = [0u8; 32];
-    let fixed_input = [0u8; 32]; // Same as secret - might trigger timing leak
-    let random_input = || {
-        let mut arr = [0u8; 32];
-        for i in 0..32 {
-            arr[i] = rand::random();
-        }
-        arr
-    };
+
+    // ✅ CORRECT: Pre-generate inputs outside closures
+    // Both fixed and random generators are called BEFORE measurement
+    let inputs = InputPair::new(
+        [0u8; 32],  // Fixed: all zeros (same as secret)
+        || {
+            let mut arr = [0u8; 32];
+            for i in 0..32 {
+                arr[i] = rand::random();
+            }
+            arr
+        },
+    );
 
     // Simple API with default config
     let result = test(
-        || compare_bytes(&secret, &fixed_input),
-        || compare_bytes(&secret, &random_input()),
+        || compare_bytes(&secret, inputs.fixed()),
+        || compare_bytes(&secret, inputs.random()),
     );
 
     println!("Leak probability: {:.1}%", result.leak_probability * 100.0);
@@ -31,8 +41,8 @@ fn main() {
         .samples(10_000) // Fewer samples for quick demo
         .ci_alpha(0.01)
         .test(
-            || compare_bytes(&secret, &fixed_input),
-            || compare_bytes(&secret, &random_input()),
+            || compare_bytes(&secret, inputs.fixed()),
+            || compare_bytes(&secret, inputs.random()),
         );
 
     println!("\nWith custom config:");

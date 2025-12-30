@@ -125,7 +125,19 @@ pub enum MeasurementQuality {
 
 impl MeasurementQuality {
     /// Determine quality from minimum detectable effect.
+    ///
+    /// Invalid MDE values (≤ 0 or non-finite) indicate a measurement problem
+    /// and are classified as `TooNoisy`.
+    ///
+    /// Very small MDE (< 0.01 ns) also indicates timer resolution issues
+    /// where most samples have identical values.
     pub fn from_mde_ns(mde_ns: f64) -> Self {
+        // Invalid MDE indicates measurement failure (e.g., timer resolution too coarse)
+        // Very small MDE (< 0.01ns) also indicates collapsed measurement data
+        if mde_ns <= 0.01 || !mde_ns.is_finite() {
+            return MeasurementQuality::TooNoisy;
+        }
+
         if mde_ns < 5.0 {
             MeasurementQuality::Excellent
         } else if mde_ns < 20.0 {
@@ -147,6 +159,10 @@ pub struct Metadata {
     pub cycles_per_ns: f64,
     /// Timer type used.
     pub timer: String,
+    /// Timer resolution in nanoseconds.
+    pub timer_resolution_ns: f64,
+    /// Iterations per sample (for batched measurement).
+    pub iterations_per_sample: usize,
     /// Total runtime in seconds.
     pub runtime_secs: f64,
 }
