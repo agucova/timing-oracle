@@ -89,6 +89,24 @@ let result = test(
 
 Both closures now execute **identical code paths** - only the data differs.
 
+The `helpers` module provides convenient utilities for common patterns:
+
+```rust
+use timing_oracle::helpers;
+
+// Byte arrays
+let inputs = helpers::byte_arrays_32();
+
+// Byte vectors of specific length
+let inputs = helpers::byte_vecs(1024);
+
+// Custom types with generators
+let inputs = InputPair::from_fn(
+    || vec![0u8; 1024],           // Fixed generator
+    || random_vec(1024)           // Random generator
+);
+```
+
 ### Side-Effects to Avoid
 
 Inside measured closures, never:
@@ -146,10 +164,47 @@ if !result.ci_gate.passed {
 timing-oracle = "0.1"
 ```
 
+### Feature Flags
+
+By default, the library includes:
+- **`parallel`** - Rayon-based parallel bootstrap (4-8x speedup on multi-core systems)
+- **`kperf`** (macOS ARM64 only) - Compiles PMU-based cycle counting support (opt-in, requires `sudo`)
+- **`perf`** (Linux only) - Compiles perf_event-based cycle counting support (opt-in, requires `sudo` or `CAP_PERFMON`)
+
+The kperf/perf features compile in advanced timer support but don't enable it by default - see "Advanced: Cycle-Accurate Timing" below for how to use them.
+
+**To disable default features (e.g., for minimal builds):**
+```toml
+[dev-dependencies]
+timing-oracle = { version = "0.1", default-features = false }
+```
+
+**Advanced: Cycle-Accurate Timing (Optional)**
+
+For maximum timing precision on Apple Silicon or Linux, you can explicitly use PMU-based timers:
+
+```rust
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "kperf"))]
+use timing_oracle::measurement::kperf::PmuTimer;
+
+#[cfg(all(target_os = "linux", feature = "perf"))]
+use timing_oracle::measurement::perf::LinuxPerfTimer;
+
+// macOS: Use PmuTimer (requires sudo)
+let pmu_timer = PmuTimer::new().expect("Run with sudo for PMU access");
+let cycles = pmu_timer.measure_cycles(|| my_operation());
+
+// Linux: Use LinuxPerfTimer (requires sudo or CAP_PERFMON)
+let perf_timer = LinuxPerfTimer::new().expect("Run with sudo or grant CAP_PERFMON");
+let cycles = perf_timer.measure_cycles(|| my_operation());
+```
+
+These advanced timers provide ~1ns resolution on Apple Silicon (vs ~42ns default) and on ARM64 Linux systems with coarse timers.
+
 ## Build & Test
 
 ```bash
-cargo build                     # Build the library
+cargo build                     # Build with all features (parallel + kperf/perf)
 cargo test                      # Run all tests (unit + integration)
 cargo test --lib                # Run only unit tests
 
@@ -161,14 +216,21 @@ cargo test --test aes_timing    # Run AES-128 encryption tests (DudeCT pattern)
 cargo test --test ecc_timing    # Run Curve25519 ECDH tests (DudeCT pattern)
 
 # Fast test execution
-cargo nextest run               # Faster test runner
+cargo nextest run               # Faster test runner (parallel enabled by default)
 cargo nextest run --profile timing # Single-threaded timing profile
 
-# Performance optimization
-cargo build --features parallel # Enable rayon parallelism
+# Run tests (includes kperf/perf test suites if on macOS/Linux with sudo)
+sudo cargo test                 # Tests PmuTimer/LinuxPerfTimer functionality
 
-# Benchmarks (Criterion)
-cargo bench                    # Microbenchmarks of the timing pipeline (small sample sizes)
+# Benchmarks
+cargo bench                     # Microbenchmarks (Criterion, small sample sizes)
+cargo bench --bench comparison  # Compare with DudeCT (large sample sizes)
+
+# Examples
+cargo run --example simple      # Basic usage demonstration
+cargo run --example compare     # Vulnerable vs constant-time comparison
+cargo run --example aes         # AES timing analysis
+cargo run --example test_xor    # XOR operation (should be constant-time)
 ```
 
 **Note:** Integration tests use 50k-100k samples and may take 2-5 minutes each. Use `TimingOracle::quick()` during development for faster iteration.
@@ -203,6 +265,49 @@ Existing tools like [dudect](https://github.com/oreparaz/dudect) detect such lea
 - Output t-statistics instead of interpretable probabilities
 - No bounded false positive rate for CI integration
 - Miss non-uniform timing effects (e.g., cache-related tail behavior)
+
+## Timer Selection and Adaptive Batching
+
+The library automatically selects the best available timer for your platform:
+
+### Platform Timers
+
+**x86_64:**
+- Uses `rdtsc` instruction (~1ns resolution)
+- Cycle-accurate timing without requiring privileges
+
+**macOS ARM64 (Apple Silicon):**
+- **Standard Timer** (default): `cntvct_el0` virtual timer (~42ns resolution for M1/M2/M3 at 24 MHz)
+- **PmuTimer** (opt-in, requires `sudo`): PMU-based cycle counting (~1ns resolution) - see "Advanced: Cycle-Accurate Timing"
+
+**Linux:**
+- **x86_64**: `rdtsc` instruction (~1ns, no privileges needed)
+- **ARM64 Standard Timer** (default): `cntvct_el0` virtual timer (resolution varies by SoC)
+  - ARMv8.6+ (Graviton4): ~1ns (1 GHz)
+  - Ampere Altra: ~40ns (25 MHz)
+  - Raspberry Pi 4: ~18ns (54 MHz)
+- **LinuxPerfTimer** (opt-in, requires `sudo`/`CAP_PERFMON`): perf_event cycle counting (~1ns) - see "Advanced: Cycle-Accurate Timing"
+
+### Adaptive Batching
+
+On platforms with coarse timer resolution (>5 ticks per operation), the library automatically enables **adaptive batching**:
+
+1. **Pilot phase**: Measures ~100 warmup iterations to determine median operation time
+2. **K selection**: Chooses batch size K to achieve 50+ timer ticks per batch
+3. **Batch measurement**: Measures K iterations together and analyzes batch totals (reported with K)
+4. **Bounded batching**: Never exceeds K=20 to prevent microarchitectural artifacts
+
+**Example:** On Apple Silicon (42ns resolution) measuring a 100ns operation:
+- Single call: ~2.4 ticks → unreliable (quantization noise)
+- Batch of K=21: ~50 ticks → stable distribution for statistical inference
+
+Batching is **automatically disabled** when:
+- Timer resolution is fine enough (>5 ticks per call)
+- Using `PmuTimer` (macOS) or `LinuxPerfTimer` (Linux) for cycle-accurate timing
+- Operation is slow enough (>210ns on Apple Silicon with standard timer)
+- Running on x86_64 (rdtsc provides cycle-accurate timing)
+
+Batching is automatic in the public API; to avoid it entirely, use `PmuTimer` (macOS) or `LinuxPerfTimer` (Linux) for cycle-accurate timing.
 
 ## Architecture
 

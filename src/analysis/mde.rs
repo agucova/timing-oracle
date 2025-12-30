@@ -110,7 +110,7 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
         return 0.0;
     }
 
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values.sort_by(|a, b| a.total_cmp(b));
 
     let idx = (p * (values.len() - 1) as f64).round() as usize;
     let idx = idx.min(values.len() - 1);

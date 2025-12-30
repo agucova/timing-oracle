@@ -84,7 +84,7 @@ const SANITY_BOOTSTRAP: usize = 1000;
 /// # Returns
 ///
 /// `Some(SanityWarning)` if an issue is detected, `None` otherwise.
-pub fn sanity_check(fixed_samples: &[f64]) -> Option<SanityWarning> {
+pub fn sanity_check(fixed_samples: &[f64], timer_resolution_ns: f64) -> Option<SanityWarning> {
     // Check if we have enough samples
     if fixed_samples.len() < MIN_SAMPLES_FOR_SANITY {
         return Some(SanityWarning::InsufficientSamples {
@@ -98,7 +98,7 @@ pub fn sanity_check(fixed_samples: &[f64]) -> Option<SanityWarning> {
     let first_half = &fixed_samples[..mid];
     let second_half = &fixed_samples[mid..];
 
-    let leak_probability = compute_full_leak_check(first_half, second_half);
+    let leak_probability = compute_full_leak_check(first_half, second_half, timer_resolution_ns);
 
     if leak_probability > LEAK_THRESHOLD {
         Some(SanityWarning::BrokenHarness { leak_probability })
@@ -108,7 +108,7 @@ pub fn sanity_check(fixed_samples: &[f64]) -> Option<SanityWarning> {
 }
 
 /// Full leak check using the core quantile-based analysis pipeline.
-fn compute_full_leak_check(first: &[f64], second: &[f64]) -> f64 {
+fn compute_full_leak_check(first: &[f64], second: &[f64], timer_resolution_ns: f64) -> f64 {
     if first.is_empty() || second.is_empty() {
         return 0.0;
     }
@@ -135,6 +135,7 @@ fn compute_full_leak_check(first: &[f64], second: &[f64]) -> f64 {
         alpha: SANITY_ALPHA,
         bootstrap_iterations: SANITY_BOOTSTRAP,
         seed: Some(999),
+        timer_resolution_ns,
     };
     let ci_gate = run_ci_gate(&ci_gate_input);
 
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn test_insufficient_samples() {
         let samples = vec![1.0; 100];
-        let result = sanity_check(&samples);
+        let result = sanity_check(&samples, 1.0);
         assert!(matches!(
             result,
             Some(SanityWarning::InsufficientSamples { .. })
@@ -163,7 +164,7 @@ mod tests {
     #[test]
     fn test_identical_samples_pass() {
         let samples: Vec<f64> = (0..2000).map(|i| 100.0 + (i % 10) as f64).collect();
-        let result = sanity_check(&samples);
+        let result = sanity_check(&samples, 1.0);
 
         match result {
             None => {}

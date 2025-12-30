@@ -1,6 +1,15 @@
 //! JSON serialization for timing analysis results.
 
-use crate::result::TestResult;
+use serde::Serialize;
+
+use crate::result::{TestResult, UnmeasurableInfo};
+
+#[derive(Serialize)]
+struct JsonOutcome<'a> {
+    status: &'a str,
+    unmeasurable: Option<&'a UnmeasurableInfo>,
+    result: &'a TestResult,
+}
 
 /// Serialize a TestResult to a compact JSON string.
 ///
@@ -8,7 +17,18 @@ use crate::result::TestResult;
 ///
 /// Returns an error if serialization fails (should not happen for TestResult).
 pub fn to_json(result: &TestResult) -> Result<String, serde_json::Error> {
-    serde_json::to_string(result)
+    let unmeasurable = result.metadata.batching.unmeasurable.as_ref();
+    let status = if unmeasurable.is_some() {
+        "unmeasurable"
+    } else {
+        "completed"
+    };
+    let outcome = JsonOutcome {
+        status,
+        unmeasurable,
+        result,
+    };
+    serde_json::to_string(&outcome)
 }
 
 /// Serialize a TestResult to a pretty-printed JSON string.
@@ -17,7 +37,18 @@ pub fn to_json(result: &TestResult) -> Result<String, serde_json::Error> {
 ///
 /// Returns an error if serialization fails (should not happen for TestResult).
 pub fn to_json_pretty(result: &TestResult) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(result)
+    let unmeasurable = result.metadata.batching.unmeasurable.as_ref();
+    let status = if unmeasurable.is_some() {
+        "unmeasurable"
+    } else {
+        "completed"
+    };
+    let outcome = JsonOutcome {
+        status,
+        unmeasurable,
+        result,
+    };
+    serde_json::to_string_pretty(&outcome)
 }
 
 #[cfg(test)]
@@ -55,7 +86,13 @@ mod tests {
                 cycles_per_ns: 3.0,
                 timer: "rdtsc".to_string(),
                 timer_resolution_ns: 0.33,
-                iterations_per_sample: 1,
+                batching: crate::result::BatchingInfo {
+                    enabled: false,
+                    k: 1,
+                    ticks_per_batch: 1.0,
+                    rationale: "No batching".to_string(),
+                    unmeasurable: None,
+                },
                 runtime_secs: 1.5,
             },
         }
@@ -65,6 +102,7 @@ mod tests {
     fn test_to_json() {
         let result = make_test_result();
         let json = to_json(&result).unwrap();
+        assert!(json.contains("\"status\":\"completed\""));
         assert!(json.contains("\"leak_probability\":0.85"));
         assert!(json.contains("\"shift_ns\":150.0"));
     }
@@ -74,6 +112,7 @@ mod tests {
         let result = make_test_result();
         let json = to_json_pretty(&result).unwrap();
         assert!(json.contains('\n')); // Pretty print has newlines
+        assert!(json.contains("\"status\": \"completed\""));
         assert!(json.contains("leak_probability"));
     }
 }

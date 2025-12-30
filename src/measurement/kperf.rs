@@ -27,6 +27,15 @@
 //! actual CPU cycles. These are accessed through the undocumented kperf framework.
 //! Unlike the virtual timer (cntvct_el0) which runs at 24 MHz, PMCs run at CPU
 //! frequency (~3 GHz), providing ~100x better resolution.
+//!
+//! # Implementation Notes
+//!
+//! This module works around a bug in kperf-rs where `PerfCounter::reset()` calls
+//! `kperf_reset()`, which is a **global** reset that stops all kpc counting system-wide,
+//! rather than just resetting the counter value. We avoid `reset()` entirely and instead
+//! manually track deltas between `read()` calls.
+//!
+//! See: <https://github.com/El-Naizin/rust-kperf/issues/1>
 
 use std::sync::atomic::{compiler_fence, Ordering};
 
@@ -118,20 +127,53 @@ impl PmuTimer {
     fn calibrate(counter: &mut kperf_rs::PerfCounter) -> f64 {
         use std::time::Instant;
 
+        // IMPORTANT: Thread counters only count cycles when the thread is RUNNING.
+        // Using sleep() doesn't work because the thread isn't consuming CPU cycles.
+        // We must use a busy loop that actually burns CPU cycles.
+        //
+        // NOTE: We avoid calling counter.reset() because kperf-rs's reset() calls
+        // kperf_reset() which is a GLOBAL reset that stops all kpc counting.
+        // Instead, we manually track deltas between reads.
+
         let mut ratios = Vec::with_capacity(10);
+
+        // Get initial counter value
+        let mut prev_cycles = match counter.read() {
+            Ok(c) => c,
+            Err(_) => return 3.0, // Fallback if we can't read
+        };
+
         for _ in 0..10 {
-            // Reset and read start
-            let _ = counter.reset();
             let start_time = Instant::now();
 
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // Busy loop that burns ~1ms of CPU cycles
+            // Use volatile-style operations to prevent optimization
+            let mut dummy: u64 = 1;
+            loop {
+                // Simple arithmetic that can't be optimized away easily
+                dummy = dummy.wrapping_mul(6364136223846793005).wrapping_add(1);
+                std::hint::black_box(dummy);
 
-            // Read cycles
-            let cycles = counter.read().unwrap_or(0);
+                // Check wall clock time periodically
+                // (checking every iteration would dominate measurement)
+                if dummy & 0xFFFF == 0 {
+                    if start_time.elapsed().as_micros() >= 1000 {
+                        break;
+                    }
+                }
+            }
+
+            // Read cycles after busy work and compute delta
+            let current_cycles = match counter.read() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
             let elapsed_nanos = start_time.elapsed().as_nanos() as u64;
+            let delta_cycles = current_cycles.saturating_sub(prev_cycles);
+            prev_cycles = current_cycles;
 
-            if elapsed_nanos > 0 && cycles > 0 {
-                ratios.push(cycles as f64 / elapsed_nanos as f64);
+            if elapsed_nanos > 0 && delta_cycles > 0 {
+                ratios.push(delta_cycles as f64 / elapsed_nanos as f64);
             }
         }
 
@@ -140,21 +182,30 @@ impl PmuTimer {
             return 3.0;
         }
 
-        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ratios.sort_by(|a, b| a.total_cmp(b));
         ratios[ratios.len() / 2]
     }
 
     /// Measure execution time in cycles.
+    ///
+    /// Returns 0 if the measurement fails (e.g., read error).
     #[inline]
     pub fn measure_cycles<F, T>(&mut self, f: F) -> u64
     where
         F: FnOnce() -> T,
     {
-        let _ = self.counter.reset();
+        // NOTE: We avoid calling counter.reset() because kperf-rs's reset() calls
+        // kperf_reset() which is a GLOBAL reset that stops all kpc counting.
+        // Instead, we read before and after and compute the delta.
+        let start = match self.counter.read() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
         compiler_fence(Ordering::SeqCst);
         std::hint::black_box(f());
         compiler_fence(Ordering::SeqCst);
-        self.counter.read().unwrap_or(0)
+        let end = self.counter.read().unwrap_or(start);
+        end.saturating_sub(start)
     }
 
     /// Convert cycles to nanoseconds.

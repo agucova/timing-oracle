@@ -66,13 +66,13 @@ pub mod statistics;
 pub mod helpers;
 
 // Re-exports for public API
-pub use config::Config;
+pub use config::{Config, IterationsPerSample};
 pub use constants::{B_TAIL, DECILES, LOG_2PI, ONES};
 pub use measurement::Timer;
 pub use oracle::TimingOracle;
 pub use result::{
-    CiGate, Effect, EffectPattern, Exploitability, MeasurementQuality, Metadata,
-    MinDetectableEffect, TestResult,
+    BatchingInfo, CiGate, Effect, EffectPattern, Exploitability, MeasurementQuality, Metadata,
+    MinDetectableEffect, TestResult, UnmeasurableInfo,
 };
 pub use ci::{CiFailure, CiRunOutcome, CiTestBuilder, FailCriterion, Mode};
 pub use types::{Class, Matrix9, Matrix9x2, Vector9};

@@ -57,8 +57,23 @@ fn env_merge_and_fail_on_probability() {
 
     let builder = CiTestBuilder::new().from_env();
     match builder.run(
-        || std::hint::black_box(1 + 1),
-        || std::hint::black_box(2 + 2),
+        || {
+            // Make measurable with busy work (~1000ns on ARM, >10 ticks)
+            // Higher count needed for concurrent test execution
+            let mut x = 0u64;
+            for i in 0..1000 {
+                x = x.wrapping_add(std::hint::black_box(i));
+            }
+            std::hint::black_box(x)
+        },
+        || {
+            // Slightly different - extra iterations to create timing difference
+            let mut x = 0u64;
+            for i in 0..1100 {
+                x = x.wrapping_add(std::hint::black_box(i));
+            }
+            std::hint::black_box(x)
+        },
     ) {
         Err(CiFailure::LeakDetected { outcome }) => {
             assert_eq!(outcome.mode, Mode::Full);
@@ -93,8 +108,23 @@ fn async_flag_inflates_priors_and_thresholds() {
         .fail_on(FailCriterion::Probability(0.0));
 
     match builder.run(
-        || std::hint::black_box(5),
-        || std::hint::black_box(6),
+        || {
+            // Make measurable with busy work (~1000ns on ARM, >10 ticks)
+            // Higher count needed for concurrent test execution
+            let mut x = 0u64;
+            for i in 0..1000 {
+                x = x.wrapping_add(std::hint::black_box(i));
+            }
+            std::hint::black_box(x)
+        },
+        || {
+            // Slightly different - extra iterations to create timing difference
+            let mut x = 0u64;
+            for i in 0..1100 {
+                x = x.wrapping_add(std::hint::black_box(i));
+            }
+            std::hint::black_box(x)
+        },
     ) {
         Err(CiFailure::LeakDetected { outcome }) => {
             assert!(outcome.async_workload, "async flag should propagate to outcome");
@@ -122,8 +152,23 @@ fn report_contains_metadata() {
         .report_path(&report_path);
 
     match builder.run(
-        || std::hint::black_box(7),
-        || std::hint::black_box(8),
+        || {
+            // Make measurable with busy work (~1000ns on ARM, >10 ticks)
+            // Higher count needed for concurrent test execution
+            let mut x = 0u64;
+            for i in 0..1000 {
+                x = x.wrapping_add(std::hint::black_box(i));
+            }
+            std::hint::black_box(x)
+        },
+        || {
+            // Slightly different - extra iterations to create timing difference
+            let mut x = 0u64;
+            for i in 0..1100 {
+                x = x.wrapping_add(std::hint::black_box(i));
+            }
+            std::hint::black_box(x)
+        },
     ) {
         Err(CiFailure::LeakDetected { outcome: _ }) => {
             assert!(report_path.exists(), "report should be written");

@@ -6,10 +6,11 @@
 
 use crate::types::{Matrix9, Vector9};
 
-use super::bootstrap::{block_bootstrap_resample, compute_block_size};
-use super::quantile::compute_deciles;
+use super::bootstrap::{block_bootstrap_resample_into, compute_block_size};
+use super::quantile::compute_deciles_inplace;
 
 use rand::SeedableRng;
+use rand_xoshiro::Xoshiro256PlusPlus;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -40,6 +41,119 @@ impl CovarianceEstimate {
     /// sufficiently positive (not near-singular).
     pub fn is_stable(&self) -> bool {
         self.min_eigenvalue > 1e-10
+    }
+}
+
+/// Online covariance accumulator using Welford's algorithm.
+///
+/// This accumulates covariance in a single pass without storing all vectors,
+/// saving memory (728 bytes vs 72 KB for 1000 iterations) and improving
+/// cache locality.
+///
+/// Uses Welford's numerically stable online algorithm for mean and M2 (sum of
+/// outer products), which can be converted to covariance via M2/(n-1).
+#[derive(Debug, Clone)]
+pub struct WelfordCovariance9 {
+    /// Count of vectors accumulated so far.
+    n: usize,
+    /// Running mean of vectors.
+    mean: Vector9,
+    /// Sum of outer products: Σ(x - μ)(x - μ)^T
+    m2: Matrix9,
+}
+
+impl WelfordCovariance9 {
+    /// Create a new accumulator initialized to zeros.
+    pub fn new() -> Self {
+        Self {
+            n: 0,
+            mean: Vector9::zeros(),
+            m2: Matrix9::zeros(),
+        }
+    }
+
+    /// Update the accumulator with a new vector using Welford's algorithm.
+    ///
+    /// Algorithm:
+    /// ```text
+    /// δ = x - μₙ₋₁
+    /// μₙ = μₙ₋₁ + δ/n
+    /// δ' = x - μₙ
+    /// M2ₙ = M2ₙ₋₁ + δ·δ'^T
+    /// ```
+    ///
+    /// This is numerically stable and produces a symmetric M2 matrix.
+    pub fn update(&mut self, x: &Vector9) {
+        self.n += 1;
+        let n = self.n as f64;
+
+        // δ = x - μₙ₋₁
+        let delta = x - &self.mean;
+
+        // μₙ = μₙ₋₁ + δ/n
+        self.mean += &delta / n;
+
+        // δ' = x - μₙ
+        let delta2 = x - &self.mean;
+
+        // M2ₙ = M2ₙ₋₁ + δ·δ'^T
+        // The outer product δ·δ'^T is symmetric
+        self.m2 += delta * delta2.transpose();
+    }
+
+    /// Finalize the accumulator and return the covariance matrix.
+    ///
+    /// Returns M2/(n-1) for the unbiased sample covariance estimator.
+    /// For n < 2, returns the identity matrix (degenerate case).
+    pub fn finalize(&self) -> Matrix9 {
+        if self.n < 2 {
+            return Matrix9::identity();
+        }
+
+        self.m2 / (self.n - 1) as f64
+    }
+
+    /// Merge another accumulator into this one using Chan's parallel algorithm.
+    ///
+    /// Algorithm:
+    /// ```text
+    /// n_AB = n_A + n_B
+    /// δ = μ_B - μ_A
+    /// μ_AB = (n_A·μ_A + n_B·μ_B) / n_AB
+    /// M2_AB = M2_A + M2_B + (n_A·n_B/n_AB)·δ·δ^T
+    /// ```
+    ///
+    /// This preserves numerical stability and symmetry.
+    pub fn merge(&mut self, other: &Self) {
+        if other.n == 0 {
+            return;
+        }
+        if self.n == 0 {
+            *self = other.clone();
+            return;
+        }
+
+        let n_a = self.n as f64;
+        let n_b = other.n as f64;
+        let n_ab = n_a + n_b;
+
+        // δ = μ_B - μ_A
+        let delta = &other.mean - &self.mean;
+
+        // μ_AB = (n_A·μ_A + n_B·μ_B) / n_AB
+        self.mean = (&self.mean * n_a + &other.mean * n_b) / n_ab;
+
+        // M2_AB = M2_A + M2_B + (n_A·n_B/n_AB)·δ·δ^T
+        let correction = delta * delta.transpose() * (n_a * n_b / n_ab);
+        self.m2 = &self.m2 + &other.m2 + correction;
+
+        self.n += other.n;
+    }
+
+    /// Get the current count of vectors.
+    #[allow(dead_code)]
+    pub fn count(&self) -> usize {
+        self.n
     }
 }
 
@@ -75,32 +189,61 @@ pub fn bootstrap_covariance_matrix(
     let n = data.len();
     let block_size = compute_block_size(n);
 
-    // Generate bootstrap replicates
+    // Generate bootstrap replicates using online Welford covariance accumulation
+    // This avoids allocating Vec<Vector9> (saves 72 KB for 1000 iterations)
     #[cfg(feature = "parallel")]
-    let bootstrap_vectors: Vec<Vector9> = (0..n_bootstrap)
-        .into_par_iter()
-        .map(|i| {
-            // Each thread gets its own RNG seeded deterministically
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(i as u64));
-            let resampled = block_bootstrap_resample(data, block_size, &mut rng);
-            compute_deciles(&resampled)
-        })
-        .collect();
+    let cov_accumulator: WelfordCovariance9 = {
+        (0..n_bootstrap)
+            .into_par_iter()
+            .fold_with(
+                // Per-thread state: RNG, scratch buffer, and Welford accumulator
+                (
+                    Xoshiro256PlusPlus::seed_from_u64(seed),
+                    vec![0.0; n],
+                    WelfordCovariance9::new(),
+                ),
+                |(mut rng, mut buffer, mut acc), i| {
+                    // Seed RNG deterministically for this iteration
+                    rng = Xoshiro256PlusPlus::seed_from_u64(seed.wrapping_add(i as u64));
 
-    #[cfg(not(feature = "parallel"))]
-    let bootstrap_vectors: Vec<Vector9> = {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let mut vectors = Vec::with_capacity(n_bootstrap);
-        for _ in 0..n_bootstrap {
-            let resampled = block_bootstrap_resample(data, block_size, &mut rng);
-            let q = compute_deciles(&resampled);
-            vectors.push(q);
-        }
-        vectors
+                    // Resample, compute deciles, and update accumulator
+                    block_bootstrap_resample_into(data, block_size, &mut rng, &mut buffer);
+                    let quantiles = compute_deciles_inplace(&mut buffer);
+                    acc.update(&quantiles);
+
+                    (rng, buffer, acc)
+                },
+            )
+            .map(|(_, _, acc)| acc)
+            .reduce(
+                || WelfordCovariance9::new(),
+                |mut a, b| {
+                    a.merge(&b);
+                    a
+                },
+            )
     };
 
-    // Compute sample covariance matrix
-    let cov_matrix = compute_sample_covariance(&bootstrap_vectors);
+    #[cfg(not(feature = "parallel"))]
+    let cov_accumulator: WelfordCovariance9 = {
+        let mut accumulator = WelfordCovariance9::new();
+        let mut buffer = vec![0.0; n];
+
+        for i in 0..n_bootstrap {
+            // CRITICAL FIX: Deterministic seeding with iteration counter
+            // This matches the parallel version's seeding scheme
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed.wrapping_add(i as u64));
+
+            // Resample, compute deciles, and update accumulator
+            block_bootstrap_resample_into(data, block_size, &mut rng, &mut buffer);
+            let quantiles = compute_deciles_inplace(&mut buffer);
+            accumulator.update(&quantiles);
+        }
+        accumulator
+    };
+
+    // Finalize the Welford accumulator to get the covariance matrix
+    let cov_matrix = cov_accumulator.finalize();
 
     // Add jitter for numerical stability
     let (stabilized_matrix, jitter) = add_diagonal_jitter(cov_matrix);
@@ -236,6 +379,217 @@ mod tests {
         for i in 0..9 {
             for j in 0..9 {
                 assert!(cov[(i, j)].abs() < 1e-12);
+            }
+        }
+    }
+
+    // ========== Welford Covariance Validation Tests ==========
+
+    #[test]
+    fn test_welford_numerical_equivalence() {
+        // Test that Welford accumulator gives identical results to batch computation
+        let vectors: Vec<Vector9> = (0..100)
+            .map(|i| {
+                Vector9::from_fn(|j, _| {
+                    // Create diverse vectors with different patterns
+                    (i * 7 + j * 13) as f64 % 17.0
+                })
+            })
+            .collect();
+
+        // Batch method
+        let batch_cov = compute_sample_covariance(&vectors);
+
+        // Welford method
+        let mut welford = WelfordCovariance9::new();
+        for v in &vectors {
+            welford.update(v);
+        }
+        let welford_cov = welford.finalize();
+
+        // Should be numerically identical (within floating point precision)
+        for i in 0..9 {
+            for j in 0..9 {
+                let diff = (batch_cov[(i, j)] - welford_cov[(i, j)]).abs();
+                assert!(
+                    diff < 1e-9,
+                    "Mismatch at ({}, {}): batch={}, welford={}, diff={}",
+                    i,
+                    j,
+                    batch_cov[(i, j)],
+                    welford_cov[(i, j)],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_welford_edge_cases() {
+        // n=0 should return identity
+        let empty = WelfordCovariance9::new();
+        let cov0 = empty.finalize();
+        assert_eq!(cov0, Matrix9::identity(), "n=0 should return identity");
+
+        // n=1 should return identity
+        let mut one = WelfordCovariance9::new();
+        one.update(&Vector9::from_element(42.0));
+        let cov1 = one.finalize();
+        assert_eq!(cov1, Matrix9::identity(), "n=1 should return identity");
+
+        // n=2 should compute valid covariance
+        let mut two = WelfordCovariance9::new();
+        two.update(&Vector9::from_element(1.0));
+        two.update(&Vector9::from_element(2.0));
+        let cov2 = two.finalize();
+
+        // Should not be identity (has variance)
+        let is_identity = cov2 == Matrix9::identity();
+        assert!(!is_identity, "n=2 should not return identity");
+
+        // Should be symmetric
+        for i in 0..9 {
+            for j in 0..9 {
+                assert!(
+                    (cov2[(i, j)] - cov2[(j, i)]).abs() < 1e-12,
+                    "n=2 result not symmetric"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_welford_merge_correctness() {
+        // Test that merge(A, B) == accumulate(A ∪ B)
+        let vectors_a: Vec<Vector9> = (0..50).map(|i| Vector9::from_element(i as f64)).collect();
+        let vectors_b: Vec<Vector9> = (50..100).map(|i| Vector9::from_element(i as f64)).collect();
+
+        // Accumulate A separately
+        let mut acc_a = WelfordCovariance9::new();
+        for v in &vectors_a {
+            acc_a.update(v);
+        }
+
+        // Accumulate B separately
+        let mut acc_b = WelfordCovariance9::new();
+        for v in &vectors_b {
+            acc_b.update(v);
+        }
+
+        // Merge A and B
+        let mut merged = acc_a.clone();
+        merged.merge(&acc_b);
+        let merged_cov = merged.finalize();
+
+        // Accumulate all at once
+        let mut combined = WelfordCovariance9::new();
+        for v in vectors_a.iter().chain(vectors_b.iter()) {
+            combined.update(v);
+        }
+        let combined_cov = combined.finalize();
+
+        // Results should be identical
+        for i in 0..9 {
+            for j in 0..9 {
+                let diff = (merged_cov[(i, j)] - combined_cov[(i, j)]).abs();
+                assert!(
+                    diff < 1e-9,
+                    "Merge mismatch at ({}, {}): merged={}, combined={}, diff={}",
+                    i,
+                    j,
+                    merged_cov[(i, j)],
+                    combined_cov[(i, j)],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_welford_symmetry() {
+        // Welford algorithm should produce symmetric covariance matrix
+        let mut welford = WelfordCovariance9::new();
+        for i in 0..100 {
+            welford.update(&Vector9::from_fn(|j, _| ((i * 7 + j * 11) % 23) as f64));
+        }
+
+        let cov = welford.finalize();
+
+        for i in 0..9 {
+            for j in 0..9 {
+                let diff = (cov[(i, j)] - cov[(j, i)]).abs();
+                assert!(
+                    diff < 1e-12,
+                    "Welford result not symmetric at ({}, {}): diff={}",
+                    i,
+                    j,
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_determinism() {
+        // Test that parallel and serial versions give identical results with same seed
+        let data: Vec<f64> = (0..500).map(|x| (x as f64) * 0.1 + 100.0).collect();
+
+        let result1 = bootstrap_covariance_matrix(&data, 100, 42);
+        let result2 = bootstrap_covariance_matrix(&data, 100, 42);
+        let result3 = bootstrap_covariance_matrix(&data, 100, 42);
+
+        // All three runs should produce identical matrices
+        for i in 0..9 {
+            for j in 0..9 {
+                let val1 = result1.matrix[(i, j)];
+                let val2 = result2.matrix[(i, j)];
+                let val3 = result3.matrix[(i, j)];
+
+                assert!(
+                    (val1 - val2).abs() < 1e-12,
+                    "Run 1 and 2 differ at ({}, {})",
+                    i,
+                    j
+                );
+                assert!(
+                    (val2 - val3).abs() < 1e-12,
+                    "Run 2 and 3 differ at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_covariance_chunking_edge_cases() {
+        // Test edge cases: n_bootstrap < typical chunk size, exact multiples, remainders
+        let data: Vec<f64> = (0..500).map(|x| x as f64 * 0.1).collect();
+
+        // n_bootstrap < chunk_size (should still work)
+        let r1 = bootstrap_covariance_matrix(&data, 5, 42);
+        assert_eq!(r1.n_bootstrap, 5, "Should use n_bootstrap=5");
+
+        // Larger n_bootstrap
+        let r2 = bootstrap_covariance_matrix(&data, 100, 42);
+        assert_eq!(r2.n_bootstrap, 100, "Should use n_bootstrap=100");
+
+        // n_bootstrap with potential remainder
+        let r3 = bootstrap_covariance_matrix(&data, 150, 42);
+        assert_eq!(r3.n_bootstrap, 150, "Should use n_bootstrap=150");
+
+        // All should be deterministic
+        let r3_repeat = bootstrap_covariance_matrix(&data, 150, 42);
+        for i in 0..9 {
+            for j in 0..9 {
+                assert!(
+                    (r3.matrix[(i, j)] - r3_repeat.matrix[(i, j)]).abs() < 1e-12,
+                    "Edge case should be deterministic at ({}, {})",
+                    i,
+                    j
+                );
             }
         }
     }

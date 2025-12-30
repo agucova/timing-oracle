@@ -20,6 +20,35 @@ pub fn format_result(result: &TestResult) -> String {
         "  Samples: {} per class\n",
         result.metadata.samples_per_class
     ));
+    if let Some(unmeasurable) = &result.metadata.batching.unmeasurable {
+        output.push('\n');
+        output.push_str(&format!(
+            "  {}\n\n",
+            "\u{26A0} Operation too fast to measure reliably"
+                .yellow()
+                .bold()
+        ));
+        output.push_str(&format!(
+            "    Estimated duration: ~{:.0} ns\n",
+            unmeasurable.operation_ns
+        ));
+        output.push_str(&format!(
+            "    Timer resolution:   {:.1} ns ({})\n",
+            result.metadata.timer_resolution_ns, result.metadata.timer
+        ));
+        output.push_str(&format!(
+            "    Minimum measurable: ~{:.0} ns on this platform\n",
+            unmeasurable.threshold_ns
+        ));
+        output.push('\n');
+        output.push_str(&sep);
+        output.push('\n');
+        output.push_str(
+            "Note: Results are unmeasurable at this resolution; no leak probability is reported.\n",
+        );
+        return output;
+    }
+
     output.push_str(&format!("  Quality: {}\n", format_quality(result.quality)));
     output.push_str(&format!(
         "  Min detectable effect: {:.1} ns (shift), {:.1} ns (tail)\n",
@@ -142,7 +171,13 @@ mod tests {
                 cycles_per_ns: 3.0,
                 timer: "rdtsc".to_string(),
                 timer_resolution_ns: 0.33,
-                iterations_per_sample: 1,
+                batching: crate::result::BatchingInfo {
+                    enabled: false,
+                    k: 1,
+                    ticks_per_batch: 1.0,
+                    rationale: "No batching".to_string(),
+                    unmeasurable: None,
+                },
                 runtime_secs: 1.5,
             },
         }

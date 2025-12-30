@@ -35,6 +35,15 @@ fn main() {
     println!("Leak probability: {:.1}%", result.leak_probability * 100.0);
     println!("CI gate passed: {}", result.ci_gate.passed);
     println!("Quality: {:?}", result.quality);
+    println!("Timer: {} ({:.1}ns resolution)", result.metadata.timer, result.metadata.timer_resolution_ns);
+    println!("Batching: enabled={}, K={}, ticks_per_batch={:.1}",
+        result.metadata.batching.enabled,
+        result.metadata.batching.k,
+        result.metadata.batching.ticks_per_batch);
+    println!("Rationale: {}", result.metadata.batching.rationale);
+    println!("MDE shift: {:.2}ns, tail: {:.2}ns",
+        result.min_detectable_effect.shift_ns,
+        result.min_detectable_effect.tail_ns);
 
     // Builder API with custom config
     let result = TimingOracle::new()

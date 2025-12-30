@@ -46,7 +46,7 @@ pub struct Config {
     /// Iterations per timing sample (default: Auto).
     ///
     /// When set to `Auto`, the library detects timer resolution and
-    /// automatically batches iterations when needed (e.g., on Apple Silicon).
+    /// automatically batches iterations when needed for coarse timers.
     /// Set to a specific value to override auto-detection.
     pub iterations_per_sample: IterationsPerSample,
 }
@@ -56,9 +56,9 @@ pub struct Config {
 pub enum IterationsPerSample {
     /// Automatically detect based on timer resolution.
     ///
-    /// On Apple Silicon (~41ns resolution), this will batch multiple
-    /// iterations per sample to ensure reliable timing data.
-    /// On x86 (~1ns resolution), this typically uses 1 iteration.
+    /// On ARM64 with coarse timers (~40ns on Apple Silicon, Ampere Altra),
+    /// this will batch multiple iterations per sample for reliable timing.
+    /// On x86 or ARMv8.6+ (~1ns resolution), this typically uses 1 iteration.
     Auto,
 
     /// Use exactly N iterations per sample.
@@ -75,8 +75,8 @@ impl Default for Config {
             ci_alpha: 0.01,
             min_effect_of_concern_ns: 10.0,
             effect_threshold_ns: None,
-            ci_bootstrap_iterations: 100,  // Reduced from 500 for 5x speedup with minimal accuracy loss
-            cov_bootstrap_iterations: 50,  // Reduced from 200 for 4x speedup
+            ci_bootstrap_iterations: 10_000,  // Distribution-free FPR guarantee requires sufficient iterations
+            cov_bootstrap_iterations: 2_000,  // Accurate covariance estimation for MVN test
             outlier_percentile: 0.999,
             prior_no_leak: 0.75,
             calibration_fraction: 0.3,

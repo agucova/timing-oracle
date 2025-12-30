@@ -129,7 +129,18 @@ fn aes128_different_keys_constant_time() {
 /// AES-128 multiple blocks - tests for cumulative timing effects
 #[test]
 fn aes128_multiple_blocks_constant_time() {
-    let key = rand_bytes_16();
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand::Rng;
+
+    // Use deterministic seed for reproducibility
+    let mut rng = StdRng::seed_from_u64(0x1234_5678_9ABC_DEF0);
+
+    // Generate deterministic key
+    let mut key = [0u8; 16];
+    for byte in &mut key {
+        *byte = rng.random();
+    }
     let cipher = Aes128::new(&key.into());
 
     // Use non-pathological fixed blocks (not all-zeros)
@@ -145,22 +156,37 @@ fn aes128_multiple_blocks_constant_time() {
     ];
 
     // Pre-generate inputs using InputPair - 4 blocks per sample
+    // Use seeded RNG for deterministic random blocks
     const SAMPLES: usize = 20_000;
+    let mut rng_blocks = StdRng::seed_from_u64(0xFEDC_BA98_7654_3210);
+    let mut random_blocks_vec: Vec<[[u8; 16]; 4]> = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let mut blocks = [[0u8; 16]; 4];
+        for block in &mut blocks {
+            for byte in block {
+                *byte = rng_blocks.random();
+            }
+        }
+        random_blocks_vec.push(blocks);
+    }
+
     let inputs = InputPair::from_fn_with_samples(
         SAMPLES,
         || fixed_blocks,
-        || {
-            [
-                rand_bytes_16(),
-                rand_bytes_16(),
-                rand_bytes_16(),
-                rand_bytes_16(),
-            ]
+        {
+            let idx = std::cell::Cell::new(0);
+            move || {
+                let i = idx.get();
+                idx.set((i + 1) % SAMPLES);
+                random_blocks_vec[i]
+            }
         },
     );
 
+    // Use alpha=0.05 to reproduce original flakiness (default is 0.01)
     let result = TimingOracle::new()
         .samples(SAMPLES)
+        .ci_alpha(0.05)
         .test(
             || {
                 let blocks = inputs.fixed();
@@ -186,6 +212,22 @@ fn aes128_multiple_blocks_constant_time() {
 
     eprintln!("\n[aes128_multiple_blocks_constant_time]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
+
+    // Debug: Show CI gate details to understand boundary behavior
+    eprintln!("\nCI Gate Debug:");
+    eprintln!("  Passed: {}", result.ci_gate.passed);
+    eprintln!("  Alpha: {}", result.ci_gate.alpha);
+    for i in 0..9 {
+        let margin = result.ci_gate.thresholds[i] - result.ci_gate.observed[i].abs();
+        eprintln!(
+            "  Q{}: obs={:7.2} thresh={:7.2} margin={:7.2} {}",
+            i + 1,
+            result.ci_gate.observed[i],
+            result.ci_gate.thresholds[i],
+            margin,
+            if margin < 0.0 { "FAIL" } else { "pass" }
+        );
+    }
 
     // Multiple block encryption should maintain constant-time properties
     assert!(

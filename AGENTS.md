@@ -9,15 +9,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-cargo build                    # Build the library
-cargo build --features parallel # Build with parallel/rayon support
+cargo build                    # Build with all features (parallel + kperf/perf)
+cargo build --no-default-features  # Minimal build
 cargo test                     # Run all tests (many are ignored pending implementation)
 cargo test -- --ignored        # Run ignored tests (requires full implementation)
 cargo test <test_name>         # Run a specific test
 cargo check                    # Type-check without building
+sudo cargo test                # Run all tests including kperf/perf tests (requires elevated privileges)
 cargo run --example simple     # Run the simple example
 cargo run --example compare    # Run the compare example
+cargo run --example test_xor   # Run XOR constant-time test
+cargo bench --bench comparison # Run DudeCT comparison benchmarks
 ```
+
+### Default Features
+
+By default, the library includes:
+- **`parallel`** - Rayon-based parallel bootstrap (4-8x speedup)
+- **`kperf`** (macOS ARM64 only) - PMU-based cycle counting (opt-in via `PmuTimer`, requires `sudo`)
+- **`perf`** (Linux only) - perf_event-based cycle counting (opt-in via `LinuxPerfTimer`, requires `sudo`)
+
+The `kperf`/`perf` features compile in advanced timer support that users can opt into by explicitly using `PmuTimer` or `LinuxPerfTimer`.
 
 ## Architecture
 
@@ -37,6 +49,12 @@ The timing oracle follows a multi-layer analysis pipeline:
 - `TimingOracle` (`src/oracle.rs`) - Builder-pattern entry point
 - `Config` (`src/config.rs`) - All tunable parameters (samples, alpha, thresholds)
 - `TestResult` (`src/result.rs`) - Output struct with leak_probability, effect, ci_gate, exploitability
+- `helpers` (`src/helpers.rs`) - Utilities for pre-generating test inputs (`InputPair`, `byte_arrays_32`, `byte_vecs`)
+- `measurement/` - Platform-specific timing and sample collection
+  - `timer.rs` - Standard timer (rdtsc/cntvct_el0)
+  - `kperf.rs` - macOS PMU-based cycle counting (requires sudo)
+  - `perf.rs` - Linux perf_event cycle counting (requires sudo)
+  - `collector.rs` - Sample collection with adaptive batching
 - `statistics/` - Quantile computation, bootstrap resampling, covariance estimation
 - `output/` - Terminal and JSON formatters
 
@@ -45,6 +63,16 @@ The timing oracle follows a multi-layer analysis pipeline:
 - `Class::Fixed` / `Class::Random` - Input class identifiers
 - `Matrix9`, `Vector9` - nalgebra types for 9 decile quantile differences
 - `Exploitability` - Negligible (<100ns), PossibleLAN, LikelyLAN, PossibleRemote (>20μs)
+- `InputPair<T>` - Helper for pre-generating fixed/random test inputs with identical code paths
+
+### Adaptive Batching
+
+On platforms with coarse timer resolution (e.g., Apple Silicon's 42ns cntvct_el0), the library automatically batches operations:
+- **Pilot phase**: Measures ~100 warmup iterations to determine operation time
+- **K selection**: Chooses batch size K (1-20) to achieve 50+ timer ticks per measurement
+- **Automatic disable**: Batching disabled on x86_64, when using PmuTimer/LinuxPerfTimer, or for slow operations
+
+This compensates for timer quantization while avoiding microarchitectural artifacts from excessive batching.
 
 ### Test Organization
 
@@ -122,6 +150,19 @@ let result = TimingOracle::new()
     .ci_alpha(0.01)
     .effect_prior_ns(10.0)
     .test(fixed_closure, random_closure);
+
+// Using helpers to pre-generate inputs (recommended)
+use timing_oracle::helpers::InputPair;
+
+let inputs = InputPair::new(
+    [0u8; 32],                    // Fixed: all zeros
+    || rand::random::<[u8; 32]>() // Random: generator called per sample
+);
+
+let result = timing_oracle::test(
+    || my_function(&inputs.fixed()),   // Identical code path
+    || my_function(&inputs.random()),  // Identical code path
+);
 ```
 
 ## Performance Optimization
@@ -150,20 +191,14 @@ TimingOracle::calibration()
 
 ### Parallel Processing
 
-Enable the `parallel` feature for 4-8x speedup on multi-core systems:
+The `parallel` feature provides 4-8x speedup on multi-core systems by parallelizing bootstrap iterations across CPU cores using rayon. It's enabled by default.
+
+To disable (e.g., for debugging):
 
 ```toml
 [dependencies]
-timing-oracle = { version = "0.1", features = ["parallel"] }
+timing-oracle = { version = "0.1", default-features = false }
 ```
-
-```bash
-# Build with parallel support
-cargo build --release --features parallel
-cargo test --release --features parallel
-```
-
-The parallel feature uses rayon to parallelize bootstrap iterations across CPU cores.
 
 ### Timer Reuse
 
@@ -204,5 +239,12 @@ With parallel feature enabled on an 8-core machine:
 
 ## Feature Flags
 
-- `default` - No extra features
-- `parallel` - Enables rayon for parallel bootstrap computation
+Default features:
+- `parallel` - Rayon-based parallel bootstrap (4-8x speedup)
+- `kperf` - PMU-based cycle counting on macOS ARM64 (opt-in via `PmuTimer`, requires sudo)
+- `perf` - perf_event-based cycle counting on Linux (opt-in via `LinuxPerfTimer`, requires sudo/CAP_PERFMON)
+
+Minimal build:
+```bash
+cargo build --no-default-features
+```

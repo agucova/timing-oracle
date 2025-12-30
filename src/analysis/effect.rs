@@ -207,7 +207,7 @@ fn sample_effect_magnitude_ci(
         magnitudes.push(magnitude);
     }
 
-    magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    magnitudes.sort_by(|a, b| a.total_cmp(b));
     let lo_idx = ((n_samples as f64) * 0.025).round() as usize;
     let hi_idx = ((n_samples as f64) * 0.975).round() as usize;
     let lo = magnitudes[lo_idx.min(n_samples - 1)];

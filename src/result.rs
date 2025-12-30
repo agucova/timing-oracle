@@ -150,6 +150,32 @@ impl MeasurementQuality {
     }
 }
 
+/// Information about batching configuration used during collection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchingInfo {
+    /// Whether batching was enabled.
+    pub enabled: bool,
+    /// Iterations per batch (1 if batching disabled).
+    pub k: u32,
+    /// Effective ticks per batch measurement.
+    pub ticks_per_batch: f64,
+    /// Explanation of why batching was enabled/disabled.
+    pub rationale: String,
+    /// Whether the operation was too fast to measure reliably.
+    pub unmeasurable: Option<UnmeasurableInfo>,
+}
+
+/// Information about why an operation is unmeasurable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnmeasurableInfo {
+    /// Estimated operation duration in nanoseconds.
+    pub operation_ns: f64,
+    /// Minimum measurable threshold in nanoseconds.
+    pub threshold_ns: f64,
+    /// Ticks per call (below MIN_TICKS_SINGLE_CALL).
+    pub ticks_per_call: f64,
+}
+
 /// Metadata for debugging and analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
@@ -161,8 +187,8 @@ pub struct Metadata {
     pub timer: String,
     /// Timer resolution in nanoseconds.
     pub timer_resolution_ns: f64,
-    /// Iterations per sample (for batched measurement).
-    pub iterations_per_sample: usize,
+    /// Batching configuration and rationale.
+    pub batching: BatchingInfo,
     /// Total runtime in seconds.
     pub runtime_secs: f64,
 }

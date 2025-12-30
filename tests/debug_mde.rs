@@ -25,7 +25,7 @@ fn debug_raw_timing() {
     let timer = Timer::new();
     let collector = Collector::with_timer(timer.clone(), 100);
 
-    let (fixed_cycles, random_cycles) = collector.collect_separated(
+    let (fixed_cycles, random_cycles, _batching_info) = collector.collect_separated(
         1000,
         || {
             let val = std::hint::black_box(*indices.fixed());
@@ -106,7 +106,7 @@ fn debug_mde_issue() {
     eprintln!("Cycles per ns: {}", result.metadata.cycles_per_ns);
     eprintln!("Timer: {}", result.metadata.timer);
     eprintln!("Timer resolution: {} ns", result.metadata.timer_resolution_ns);
-    eprintln!("Iterations per sample: {}", result.metadata.iterations_per_sample);
+    eprintln!("Batching enabled: {}, k={}", result.metadata.batching.enabled, result.metadata.batching.k);
     eprintln!("Outlier fraction: {}", result.outlier_fraction);
     eprintln!();
     eprintln!("MDE shift_ns: {}", result.min_detectable_effect.shift_ns);

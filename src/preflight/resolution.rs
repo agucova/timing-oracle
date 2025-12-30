@@ -106,7 +106,7 @@ pub fn resolution_check(samples: &[f64], timer_resolution_ns: f64) -> Option<Res
 
     // Count unique values (with small tolerance for floating point)
     let mut sorted = samples.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
 
     let mut unique_count = 1;
     let mut last_value = sorted[0];

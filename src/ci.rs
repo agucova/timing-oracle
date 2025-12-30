@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{Config, TimingOracle};
-use crate::result::TestResult;
+use crate::result::{TestResult, UnmeasurableInfo};
 
 /// Preset modes for CI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,13 +377,22 @@ fn print_summary(outcome: &CiRunOutcome, failed: bool) {
         outcome.async_workload,
     );
 
-    eprintln!(
-        "timing-oracle: ci_gate={} leak_probability={:.2} effect_threshold_ns={:?} min_effect_of_concern_ns={:.2}",
-        if outcome.result.ci_gate.passed { "passed" } else { "tripped" },
-        outcome.result.leak_probability,
-        outcome.config.effect_threshold_ns,
-        outcome.config.min_effect_of_concern_ns,
-    );
+    if let Some(unmeasurable) = &outcome.result.metadata.batching.unmeasurable {
+        eprintln!(
+            "timing-oracle: unmeasurable op_ns~{:.0} threshold_ns~{:.0} timer_res_ns={:.1}",
+            unmeasurable.operation_ns,
+            unmeasurable.threshold_ns,
+            outcome.result.metadata.timer_resolution_ns,
+        );
+    } else {
+        eprintln!(
+            "timing-oracle: ci_gate={} leak_probability={:.2} effect_threshold_ns={:?} min_effect_of_concern_ns={:.2}",
+            if outcome.result.ci_gate.passed { "passed" } else { "tripped" },
+            outcome.result.leak_probability,
+            outcome.config.effect_threshold_ns,
+            outcome.config.min_effect_of_concern_ns,
+        );
+    }
 
     if let Some(path) = &outcome.report_path {
         eprintln!("timing-oracle: report saved to {}", path.display());
@@ -400,6 +409,9 @@ fn print_summary(outcome: &CiRunOutcome, failed: bool) {
 }
 
 fn should_fail(criterion: FailCriterion, result: &TestResult) -> bool {
+    if result.metadata.batching.unmeasurable.is_some() {
+        return false;
+    }
     match criterion {
         FailCriterion::CiGate => !result.ci_gate.passed,
         FailCriterion::Probability(thresh) => result.leak_probability >= thresh,
@@ -411,6 +423,8 @@ fn should_fail(criterion: FailCriterion, result: &TestResult) -> bool {
 
 #[derive(Serialize)]
 struct CiReport<'a> {
+    status: &'a str,
+    unmeasurable: Option<&'a UnmeasurableInfo>,
     mode: Mode,
     seed: Option<u64>,
     fail_on: FailCriterion,
@@ -431,7 +445,16 @@ fn write_report(outcome: &CiRunOutcome) -> Result<(), CiFailure> {
         return Ok(());
     };
 
+    let unmeasurable = outcome.result.metadata.batching.unmeasurable.as_ref();
+    let status = if unmeasurable.is_some() {
+        "unmeasurable"
+    } else {
+        "completed"
+    };
+
     let report = CiReport {
+        status,
+        unmeasurable,
         mode: outcome.mode,
         seed: outcome.seed,
         fail_on: outcome.fail_on,

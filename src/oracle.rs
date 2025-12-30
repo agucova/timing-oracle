@@ -5,7 +5,6 @@ use std::time::Instant;
 #[allow(unused_imports)]
 use rand::Rng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 
 use crate::analysis::{compute_bayes_factor, decompose_effect, estimate_mde, run_ci_gate, CiGateInput};
 use crate::ci::CiTestBuilder;
@@ -13,9 +12,10 @@ use crate::config::Config;
 use crate::measurement::{filter_outliers, Collector, Timer};
 use crate::preflight::run_all_checks;
 use crate::result::{
-    CiGate, Effect, Exploitability, MeasurementQuality, Metadata, MinDetectableEffect, TestResult,
+    BatchingInfo, CiGate, Effect, Exploitability, MeasurementQuality, Metadata, MinDetectableEffect,
+    TestResult,
 };
-use crate::statistics::{bootstrap_covariance_matrix, compute_deciles};
+use crate::statistics::{bootstrap_covariance_matrix, compute_deciles_fast};
 use crate::types::Vector9;
 
 /// Main entry point for timing analysis.
@@ -48,7 +48,7 @@ struct PipelineInputs {
     interleaved_cycles: Vec<u64>,
     fixed_gen_time_ns: Option<f64>,
     random_gen_time_ns: Option<f64>,
-    iterations_per_sample: usize,
+    batching: BatchingInfo,
 }
 
 impl Default for TimingOracle {
@@ -290,7 +290,8 @@ impl TimingOracle {
         let collector = Collector::with_timer(timer.clone(), self.config.warmup);
 
         // Step 2: Collect timing samples with randomized interleaving
-        let samples = collector.collect(self.config.samples, &mut fixed, &mut random);
+        let (samples, batching) =
+            collector.collect_with_info(self.config.samples, &mut fixed, &mut random);
         let mut fixed_cycles = Vec::with_capacity(self.config.samples);
         let mut random_cycles = Vec::with_capacity(self.config.samples);
         let mut interleaved_cycles = Vec::with_capacity(self.config.samples * 2);
@@ -311,7 +312,7 @@ impl TimingOracle {
                 interleaved_cycles,
                 fixed_gen_time_ns: None,
                 random_gen_time_ns: None,
-                iterations_per_sample: collector.iterations_per_sample(),
+                batching,
             },
             &timer,
             start_time,
@@ -455,7 +456,13 @@ impl TimingOracle {
                 interleaved_cycles,
                 fixed_gen_time_ns: Some(fixed_gen_time_ns),
                 random_gen_time_ns: Some(random_gen_time_ns),
-                iterations_per_sample: 1, // test_with_inputs doesn't use batching
+                batching: BatchingInfo {
+                    enabled: false,
+                    k: 1,
+                    ticks_per_batch: 0.0,
+                    rationale: "test_with_state doesn't use batching".to_string(),
+                    unmeasurable: None,
+                },
             },
             &timer,
             start_time,
@@ -475,11 +482,71 @@ impl TimingOracle {
             interleaved_cycles,
             fixed_gen_time_ns,
             random_gen_time_ns,
-            iterations_per_sample,
+            batching,
         } = inputs;
-        // Step 3: Outlier filtering (pooled symmetric)
+        if batching.unmeasurable.is_some() {
+            let runtime_secs = start_time.elapsed().as_secs_f64();
+            let timer_name = if cfg!(target_arch = "x86_64") {
+                "rdtsc"
+            } else if cfg!(target_arch = "aarch64") {
+                "cntvct_el0"
+            } else {
+                "Instant"
+            };
+
+            return TestResult {
+                leak_probability: 0.0,
+                effect: None,
+                exploitability: Exploitability::Negligible,
+                min_detectable_effect: MinDetectableEffect {
+                    shift_ns: 0.0,
+                    tail_ns: 0.0,
+                },
+                ci_gate: CiGate {
+                    alpha: self.config.ci_alpha,
+                    passed: true,
+                    thresholds: [0.0; 9],
+                    observed: [0.0; 9],
+                },
+                quality: MeasurementQuality::TooNoisy,
+                outlier_fraction: 0.0,
+                metadata: Metadata {
+                    samples_per_class: fixed_cycles.len().min(random_cycles.len()),
+                    cycles_per_ns: timer.cycles_per_ns(),
+                    timer: timer_name.to_string(),
+                    timer_resolution_ns: timer.resolution_ns(),
+                    batching,
+                    runtime_secs,
+                },
+            };
+        }
+
+        // Step 3a: Filter out zero measurements (kperf read failures)
+        // kperf returns 0 on counter reset/read failure, which pollutes lower quantiles
+        let fixed_nonzero: Vec<u64> = fixed_cycles.iter().copied().filter(|&c| c > 0).collect();
+        let random_nonzero: Vec<u64> = random_cycles.iter().copied().filter(|&c| c > 0).collect();
+
+        // If too many zeros were filtered, warn but continue
+        let fixed_zeros = fixed_cycles.len() - fixed_nonzero.len();
+        let random_zeros = random_cycles.len() - random_nonzero.len();
+        if fixed_zeros > fixed_cycles.len() / 10 || random_zeros > random_cycles.len() / 10 {
+            eprintln!(
+                "Warning: Filtered {} fixed and {} random zero measurements (>10%). \
+                 This may indicate kperf instability.",
+                fixed_zeros, random_zeros
+            );
+        }
+
+        // Step 3b: Outlier filtering (pooled symmetric)
         let (filtered_fixed, filtered_random, outlier_stats) =
-            filter_outliers(&fixed_cycles, &random_cycles, self.config.outlier_percentile);
+            filter_outliers(&fixed_nonzero, &random_nonzero, self.config.outlier_percentile);
+
+        eprintln!("[DEBUG] After outlier filtering ({}): fixed={} (removed {}), random={} (removed {})",
+            self.config.outlier_percentile,
+            filtered_fixed.len(),
+            fixed_nonzero.len() - filtered_fixed.len(),
+            filtered_random.len(),
+            random_nonzero.len() - filtered_random.len());
 
         // Convert cycles to nanoseconds
         let fixed_ns: Vec<f64> = filtered_fixed
@@ -492,8 +559,8 @@ impl TimingOracle {
             .collect();
 
         // Step 4: Compute full-sample quantile differences for CI gate
-        let q_fixed_full = compute_deciles(&fixed_ns);
-        let q_random_full = compute_deciles(&random_ns);
+        let q_fixed_full = compute_deciles_fast(&fixed_ns);
+        let q_random_full = compute_deciles_fast(&random_ns);
         let delta_full: Vector9 = q_fixed_full - q_random_full;
 
         // Step 5: Sample splitting (calibration/inference)
@@ -501,19 +568,17 @@ impl TimingOracle {
         let n_calib = ((n as f64) * self.config.calibration_fraction as f64).round() as usize;
         let n_calib = n_calib.max(10).min(n.saturating_sub(10)); // Ensure at least 10 samples each
 
-        let mut rng = if let Some(seed) = self.config.measurement_seed {
-            rand::rngs::StdRng::seed_from_u64(seed)
-        } else {
-            rand::rngs::StdRng::from_rng(&mut rand::rng())
-        };
+        // Split samples temporally (no shuffling - preserves autocorrelation for block bootstrap)
+        let (calib_fixed, infer_fixed) = split_calibration_temporal(&fixed_ns, n_calib);
+        let (calib_random, infer_random) = split_calibration_temporal(&random_ns, n_calib);
 
-        let mut fixed_shuffled = fixed_ns.clone();
-        let mut random_shuffled = random_ns.clone();
-        fixed_shuffled.shuffle(&mut rng);
-        random_shuffled.shuffle(&mut rng);
-
-        let (calib_fixed, infer_fixed) = fixed_shuffled.split_at(n_calib);
-        let (calib_random, infer_random) = random_shuffled.split_at(n_calib);
+        eprintln!("[DEBUG] After calibration split ({:.0}% calib, {:.0}% infer): calib_fixed={}, calib_random={}, infer_fixed={}, infer_random={}",
+            self.config.calibration_fraction * 100.0,
+            (1.0 - self.config.calibration_fraction) * 100.0,
+            calib_fixed.len(),
+            calib_random.len(),
+            infer_fixed.len(),
+            infer_random.len());
 
         // Run preflight checks
         let interleaved_ns: Vec<f64> = interleaved_cycles
@@ -526,14 +591,15 @@ impl TimingOracle {
             &interleaved_ns,
             fixed_gen_time_ns,
             random_gen_time_ns,
+            timer.resolution_ns(),
         );
 
         // CALIBRATION PHASE
         // Step 6: Estimate per-class covariances from calibration data
         let bootstrap_iters = self.config.cov_bootstrap_iterations.min(500);
 
-        let cov_fixed = bootstrap_covariance_matrix(calib_fixed, bootstrap_iters, 42);
-        let cov_random = bootstrap_covariance_matrix(calib_random, bootstrap_iters, 43);
+        let cov_fixed = bootstrap_covariance_matrix(&calib_fixed, bootstrap_iters, 42);
+        let cov_random = bootstrap_covariance_matrix(&calib_random, bootstrap_iters, 43);
 
         // Step 7: Estimate MDE from calibration covariance
         let pooled_cov = cov_fixed.matrix + cov_random.matrix;
@@ -552,8 +618,8 @@ impl TimingOracle {
 
         // INFERENCE PHASE
         // Step 8: Compute quantile difference vector from inference data
-        let q_fixed = compute_deciles(infer_fixed);
-        let q_random = compute_deciles(infer_random);
+        let q_fixed = compute_deciles_fast(&infer_fixed);
+        let q_random = compute_deciles_fast(&infer_random);
         let delta_infer: Vector9 = q_fixed - q_random;
 
         // Use calibration covariance for inference per spec
@@ -567,62 +633,9 @@ impl TimingOracle {
             alpha: self.config.ci_alpha,
             bootstrap_iterations: self.config.ci_bootstrap_iterations,
             seed: self.config.measurement_seed,
+            timer_resolution_ns: timer.resolution_ns(),
         };
         let ci_gate = run_ci_gate(&ci_gate_input);
-
-        // Early termination: Skip expensive Bayesian analysis if CI gate passes with large margin
-        // Compute the maximum ratio of observed to threshold across all quantiles
-        let ci_margin = ci_gate
-            .observed
-            .iter()
-            .zip(&ci_gate.thresholds)
-            .map(|(obs, thresh)| {
-                if *thresh > 0.0 {
-                    obs.abs() / thresh
-                } else {
-                    0.0
-                }
-            })
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(0.0);
-
-        // If CI gate passed and all observations are < 50% of thresholds, declare safe without Bayes
-        if ci_gate.passed && ci_margin < 0.5 {
-            let runtime_secs = start_time.elapsed().as_secs_f64();
-            let timer_name = if cfg!(target_arch = "x86_64") {
-                "rdtsc"
-            } else if cfg!(target_arch = "aarch64") {
-                "cntvct_el0"
-            } else {
-                "Instant"
-            };
-
-            return TestResult {
-                leak_probability: 0.0,
-                effect: None,
-                exploitability: Exploitability::Negligible,
-                min_detectable_effect: MinDetectableEffect {
-                    shift_ns: mde_estimate.shift_ns,
-                    tail_ns: mde_estimate.tail_ns,
-                },
-                ci_gate: CiGate {
-                    alpha: ci_gate.alpha,
-                    passed: ci_gate.passed,
-                    thresholds: ci_gate.thresholds,
-                    observed: ci_gate.observed,
-                },
-                quality: MeasurementQuality::from_mde_ns(mde_estimate.shift_ns),
-                outlier_fraction: outlier_stats.outlier_fraction,
-                metadata: Metadata {
-                    samples_per_class: infer_fixed.len().min(infer_random.len()),
-                    cycles_per_ns: timer.cycles_per_ns(),
-                    timer: timer_name.to_string(),
-                    timer_resolution_ns: timer.resolution_ns(),
-                    iterations_per_sample,
-                    runtime_secs,
-                },
-            };
-        }
 
         // Step 10: Compute Bayes factor and posterior probability (Layer 2)
         let bayes_result =
@@ -690,11 +703,34 @@ impl TimingOracle {
                 cycles_per_ns: timer.cycles_per_ns(),
                 timer: timer_name.to_string(),
                 timer_resolution_ns: timer.resolution_ns(),
-                iterations_per_sample,
+                batching,
                 runtime_secs,
             },
         }
     }
+}
+
+/// Split samples temporally for calibration/inference.
+///
+/// CRITICAL: This must preserve temporal order for block bootstrap to work correctly.
+/// Shuffling before block bootstrap destroys autocorrelation structure and causes
+/// Σ₀ underestimation, leading to overconfident results.
+///
+/// Returns: (calibration_samples, inference_samples)
+/// - calibration: first n_calib samples (in temporal order)
+/// - inference: remaining samples (in temporal order)
+fn split_calibration_temporal(
+    data: &[f64],
+    n_calib: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    if n_calib == 0 || data.is_empty() {
+        return (Vec::new(), data.to_vec());
+    }
+
+    let n_calib = n_calib.min(data.len());
+    let (calib, infer) = data.split_at(n_calib);
+
+    (calib.to_vec(), infer.to_vec())
 }
 
 #[cfg(test)]

@@ -149,11 +149,12 @@ pub fn run_all_checks(
     interleaved: &[f64],
     fixed_gen_time_ns: Option<f64>,
     random_gen_time_ns: Option<f64>,
+    timer_resolution_ns: f64,
 ) -> PreflightResult {
     let mut result = PreflightResult::new();
 
     // Run sanity check (Fixed-vs-Fixed)
-    if let Some(warning) = sanity_check(fixed_samples) {
+    if let Some(warning) = sanity_check(fixed_samples, timer_resolution_ns) {
         result.add_sanity_warning(warning);
     }
 

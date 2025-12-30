@@ -7,17 +7,34 @@
 //! - Branch predictor state
 //! - Other temporal effects
 
+use crate::result::{BatchingInfo, UnmeasurableInfo};
 use crate::types::Class;
 use rand::seq::SliceRandom;
 
 use super::timer::{black_box, rdtsc, Timer};
+
+/// Minimum ticks per single call for reliable measurement.
+/// Below this, we cannot distinguish timing differences from quantization noise.
+pub const MIN_TICKS_SINGLE_CALL: f64 = 5.0;
+
+/// Target ticks per batch for stable quantile-based inference.
+/// Below ~50 ticks, the empirical distribution collapses to a sparse PMF.
+pub const TARGET_TICKS_PER_BATCH: f64 = 50.0;
+
+/// Maximum batch size to limit microarchitectural state accumulation.
+/// Higher values cause false positives from cache/predictor effects.
+/// With K ≤ 20, these artifacts are limited.
+pub const MAX_BATCH_SIZE: u32 = 20;
+
+/// Number of pilot samples for adaptive K selection.
+pub const PILOT_SAMPLES: usize = 100;
 
 /// A single timing measurement sample.
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
     /// The input class (Fixed or Random).
     pub class: Class,
-    /// The measured execution time in cycles.
+    /// The measured execution time in cycles (batch total if batching enabled).
     pub cycles: u64,
 }
 
@@ -38,45 +55,41 @@ pub struct Collector {
     timer: Timer,
     /// Number of warmup iterations to run before measuring.
     warmup_iterations: usize,
-    /// Suggested iterations per sample (may be overridden by adaptive detection).
-    suggested_iterations: usize,
+    /// Maximum batch size (set to 1 to disable batching entirely).
+    max_batch_size: u32,
+    /// Target ticks per batch for adaptive K selection.
+    target_ticks_per_batch: f64,
 }
 
 impl Collector {
     /// Create a new collector with the given warmup iterations.
-    ///
-    /// Uses auto-detected iterations per sample based on timer resolution.
     pub fn new(warmup_iterations: usize) -> Self {
         let timer = Timer::new();
-        let suggested_iterations = timer.suggested_iterations(10.0);
         Self {
             timer,
             warmup_iterations,
-            suggested_iterations,
+            max_batch_size: MAX_BATCH_SIZE,
+            target_ticks_per_batch: TARGET_TICKS_PER_BATCH,
         }
     }
 
     /// Create a collector with a pre-calibrated timer.
-    ///
-    /// Uses auto-detected iterations per sample based on timer resolution.
     pub fn with_timer(timer: Timer, warmup_iterations: usize) -> Self {
-        let suggested_iterations = timer.suggested_iterations(10.0);
         Self {
             timer,
             warmup_iterations,
-            suggested_iterations,
+            max_batch_size: MAX_BATCH_SIZE,
+            target_ticks_per_batch: TARGET_TICKS_PER_BATCH,
         }
     }
 
-    /// Create a collector with explicit iterations per sample.
-    ///
-    /// Use this to override auto-detection when you know the expected
-    /// operation duration or want to force batching.
-    pub fn with_iterations(timer: Timer, warmup_iterations: usize, iterations_per_sample: usize) -> Self {
+    /// Create a collector with explicit max batch size (set to 1 to disable batching).
+    pub fn with_max_batch_size(timer: Timer, warmup_iterations: usize, max_batch_size: u32) -> Self {
         Self {
             timer,
             warmup_iterations,
-            suggested_iterations: iterations_per_sample.max(1),
+            max_batch_size: max_batch_size.max(1),
+            target_ticks_per_batch: TARGET_TICKS_PER_BATCH,
         }
     }
 
@@ -85,84 +98,153 @@ impl Collector {
         &self.timer
     }
 
-    /// Get the suggested number of iterations per sample.
+    /// Run pilot phase to measure operation duration and select K.
     ///
-    /// Note: Actual iterations may differ if adaptive detection determines
-    /// that operations are slow enough to measure individually.
-    pub fn iterations_per_sample(&self) -> usize {
-        self.suggested_iterations
-    }
-
-    /// Run warmup iterations and probe operation duration.
-    ///
-    /// This helps stabilize CPU frequency, warm caches, and train branch predictors
-    /// before actual measurements begin. It also measures a few operations to
-    /// estimate their typical duration for adaptive batching decisions.
+    /// During warmup, measures ~100 individual operations to determine
+    /// median operation time, then selects K to achieve target tick density.
     ///
     /// # Returns
     ///
-    /// The median operation duration in cycles (minimum of fixed and random).
-    fn warmup_and_probe<F, R, T>(&self, mut fixed: F, mut random: R) -> u64
+    /// BatchingInfo including K, ticks_per_batch, rationale, and unmeasurable status.
+    fn pilot_and_warmup<F, R, T>(
+        &self,
+        mut fixed: F,
+        mut random: R,
+    ) -> BatchingInfo
     where
         F: FnMut() -> T,
         R: FnMut() -> T,
     {
-        // Run most warmup iterations without measuring
-        let probe_count = 20.min(self.warmup_iterations);
-        let warmup_only = self.warmup_iterations.saturating_sub(probe_count);
+        let pilot_count = PILOT_SAMPLES.min(self.warmup_iterations);
+        let warmup_only = self.warmup_iterations.saturating_sub(pilot_count);
 
+        // Run initial warmup (without measurement)
         for _ in 0..warmup_only {
             black_box(fixed());
             black_box(random());
         }
 
-        // Probe operation duration during final warmup iterations
-        let mut fixed_samples = Vec::with_capacity(probe_count);
-        let mut random_samples = Vec::with_capacity(probe_count);
+        // Pilot phase: measure individual operations
+        let mut pilot_cycles = Vec::with_capacity(pilot_count * 2);
 
-        for _ in 0..probe_count {
+        for _ in 0..pilot_count {
             let start = rdtsc();
             black_box(fixed());
             let end = rdtsc();
-            fixed_samples.push(end.saturating_sub(start));
+            pilot_cycles.push(end.saturating_sub(start));
 
             let start = rdtsc();
             black_box(random());
             let end = rdtsc();
-            random_samples.push(end.saturating_sub(start));
+            pilot_cycles.push(end.saturating_sub(start));
         }
 
-        // Return 90th percentile of both classes combined
-        // We use high percentile because if EITHER class has occasional slow
-        // operations (tail effects), we want to detect them and avoid batching
-        // to preserve variance information
-        let percentile_90 = |samples: &mut [u64]| -> u64 {
-            if samples.is_empty() {
-                return 0;
+        // Compute median operation time
+        pilot_cycles.sort_unstable();
+        let median_cycles = pilot_cycles[pilot_cycles.len() / 2];
+        let median_ns = self.timer.cycles_to_ns(median_cycles);
+        let resolution_ns = self.timer.resolution_ns();
+
+        // Calculate ticks per call (how many timer ticks per single operation)
+        let ticks_per_call = median_ns / resolution_ns;
+        let threshold_ns = resolution_ns * MIN_TICKS_SINGLE_CALL;
+
+        // Check measurability floor
+        if ticks_per_call < MIN_TICKS_SINGLE_CALL {
+            // Operation is too fast to measure reliably
+            // Provide platform-specific suggestions
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let suggestion = ". On macOS, run with sudo to enable kperf cycle counting (~1ns resolution)";
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let suggestion = ". Run with sudo and --features perf for cycle-accurate timing";
+            #[cfg(not(target_arch = "aarch64"))]
+            let suggestion = "";
+
+            return BatchingInfo {
+                enabled: false,
+                k: 1,
+                ticks_per_batch: ticks_per_call,
+                rationale: format!(
+                    "UNMEASURABLE: {:.1} ticks/call < {:.0} minimum (op ~{:.0}ns, threshold ~{:.0}ns){}",
+                    ticks_per_call, MIN_TICKS_SINGLE_CALL, median_ns, threshold_ns, suggestion
+                ),
+                unmeasurable: Some(UnmeasurableInfo {
+                    operation_ns: median_ns,
+                    threshold_ns,
+                    ticks_per_call,
+                }),
+            };
+        }
+
+        // Select K to achieve target tick density
+        if ticks_per_call >= self.target_ticks_per_batch {
+            // No batching needed - individual measurements have enough resolution
+            BatchingInfo {
+                enabled: false,
+                k: 1,
+                ticks_per_batch: ticks_per_call,
+                rationale: format!(
+                    "no batching needed ({:.1} ticks/call >= {:.0} target)",
+                    ticks_per_call, self.target_ticks_per_batch
+                ),
+                unmeasurable: None,
             }
-            samples.sort_unstable();
-            let idx = (samples.len() as f64 * 0.9) as usize;
-            samples[idx.min(samples.len() - 1)]
-        };
+        } else {
+            // Need batching to achieve target tick density
+            let k_raw = (self.target_ticks_per_batch / ticks_per_call).ceil() as u32;
+            let k = k_raw.clamp(1, self.max_batch_size);
+            let actual_ticks = ticks_per_call * k as f64;
 
-        let fixed_p90 = percentile_90(&mut fixed_samples);
-        let random_p90 = percentile_90(&mut random_samples);
+            // Check if we hit the cap and couldn't reach target
+            let partial = actual_ticks < self.target_ticks_per_batch;
 
-        fixed_p90.max(random_p90)
+            BatchingInfo {
+                enabled: k > 1,
+                k,
+                ticks_per_batch: actual_ticks,
+                rationale: if partial {
+                    format!(
+                        "K={} ({:.1} ticks/batch < {:.0} target, capped at MAX_BATCH_SIZE={})",
+                        k, actual_ticks, self.target_ticks_per_batch, self.max_batch_size
+                    )
+                } else {
+                    format!(
+                        "K={} ({:.1} ticks/batch, {:.2} ticks/call, timer res {:.1}ns)",
+                        k, actual_ticks, ticks_per_call, resolution_ns
+                    )
+                },
+                unmeasurable: None,
+            }
+        }
     }
 
     /// Collect timing samples using randomized interleaved design.
     ///
     /// This method:
-    /// 1. Runs warmup iterations and probes operation duration
-    /// 2. Adaptively decides whether to batch based on operation duration
+    /// 1. Runs pilot phase to measure operation duration and select K
+    /// 2. Runs remaining warmup iterations
     /// 3. Creates a randomized schedule alternating Fixed/Random
     /// 4. Measures each execution and records the timing
     ///
-    /// Adaptive batching logic:
-    /// - If operations are fast (< 5× timer resolution), batch to improve precision
-    /// - If operations are slow enough, measure individually to preserve variance
-    ///   (important for detecting tail effects)
+    /// # Adaptive Batching
+    ///
+    /// When timer resolution is coarse relative to operation duration, batching
+    /// multiple iterations recovers effective resolution by measuring aggregate time.
+    ///
+    /// **Target condition:** `batch_ticks = K × operation_time / timer_resolution > 50`
+    ///
+    /// Below ~50 ticks, the empirical distribution collapses to a sparse PMF,
+    /// making quantile-based inference unstable.
+    ///
+    /// # What Batching Tests
+    ///
+    /// Batching changes the estimand: you're testing **amortized cost over K executions**
+    /// rather than individual operation timing. This is a valid threat model - real
+    /// attackers often average repeated measurements.
+    ///
+    /// When batching is enabled:
+    /// - Samples contain **batch totals** (not divided by K)
+    /// - Effect sizes should be divided by K when reporting per-call differences
     ///
     /// # Arguments
     ///
@@ -172,25 +254,20 @@ impl Collector {
     ///
     /// # Returns
     ///
-    /// A vector of `Sample` structs containing the measurements.
-    pub fn collect<F, R, T>(&self, samples_per_class: usize, mut fixed: F, mut random: R) -> Vec<Sample>
+    /// A tuple of (samples, batching_info).
+    pub fn collect_with_info<F, R, T>(
+        &self,
+        samples_per_class: usize,
+        mut fixed: F,
+        mut random: R,
+    ) -> (Vec<Sample>, BatchingInfo)
     where
         F: FnMut() -> T,
         R: FnMut() -> T,
     {
-        // Run warmup and probe operation duration
-        let probed_cycles = self.warmup_and_probe(&mut fixed, &mut random);
-        let probed_ns = self.timer.cycles_to_ns(probed_cycles);
-
-        // Adaptive batching: if operations are slow enough, don't batch
-        // This preserves variance information (important for tail effects)
-        // Threshold: operations > 5× timer resolution can be measured individually
-        let use_batching = probed_ns < self.timer.resolution_ns() * 5.0;
-        let iterations = if use_batching {
-            self.suggested_iterations
-        } else {
-            1
-        };
+        // Run pilot and warmup, get batching configuration
+        let batching_info = self.pilot_and_warmup(&mut fixed, &mut random);
+        let k = batching_info.k;
 
         // Create measurement schedule
         let schedule = self.create_schedule(samples_per_class);
@@ -198,7 +275,7 @@ impl Collector {
         // Collect measurements
         let mut samples = Vec::with_capacity(samples_per_class * 2);
 
-        if iterations <= 1 {
+        if k == 1 {
             // Single-iteration measurement
             for class in schedule {
                 let cycles = match class {
@@ -208,31 +285,48 @@ impl Collector {
                 samples.push(Sample::new(class, cycles));
             }
         } else {
-            // Batched measurement
+            // Batched measurement - return batch totals (not divided)
             for class in schedule {
                 let cycles = match class {
-                    Class::Fixed => self.measure_batched(&mut fixed, iterations),
-                    Class::Random => self.measure_batched(&mut random, iterations),
+                    Class::Fixed => self.measure_batch_total(&mut fixed, k),
+                    Class::Random => self.measure_batch_total(&mut random, k),
                 };
                 samples.push(Sample::new(class, cycles));
             }
         }
 
+        (samples, batching_info)
+    }
+
+    /// Collect timing samples (convenience method without batching info).
+    ///
+    /// For backward compatibility. Use `collect_with_info` to get batching details.
+    pub fn collect<F, R, T>(
+        &self,
+        samples_per_class: usize,
+        fixed: F,
+        random: R,
+    ) -> Vec<Sample>
+    where
+        F: FnMut() -> T,
+        R: FnMut() -> T,
+    {
+        let (samples, _) = self.collect_with_info(samples_per_class, fixed, random);
         samples
     }
 
-    /// Measure a batch of iterations and return per-iteration cycles.
+    /// Measure a batch of K iterations and return the total cycles (not divided).
     #[inline]
-    fn measure_batched<F, T>(&self, f: &mut F, iterations: usize) -> u64
+    fn measure_batch_total<F, T>(&self, f: &mut F, k: u32) -> u64
     where
         F: FnMut() -> T,
     {
         let start = rdtsc();
-        for _ in 0..iterations {
+        for _ in 0..k {
             black_box(f());
         }
         let end = rdtsc();
-        end.saturating_sub(start) / iterations as u64
+        end.saturating_sub(start)
     }
 
     /// Create a randomized interleaved measurement schedule.
@@ -253,25 +347,22 @@ impl Collector {
         schedule
     }
 
-    /// Collect samples and separate by class.
-    ///
-    /// Convenience method that collects samples and returns them
-    /// separated into Fixed and Random vectors.
+    /// Collect samples and separate by class, with batching info.
     ///
     /// # Returns
     ///
-    /// A tuple of (fixed_samples, random_samples) as cycle counts.
+    /// A tuple of (fixed_samples, random_samples, batching_info).
     pub fn collect_separated<F, R, T>(
         &self,
         samples_per_class: usize,
         fixed: F,
         random: R,
-    ) -> (Vec<u64>, Vec<u64>)
+    ) -> (Vec<u64>, Vec<u64>, BatchingInfo)
     where
         F: FnMut() -> T,
         R: FnMut() -> T,
     {
-        let samples = self.collect(samples_per_class, fixed, random);
+        let (samples, batching_info) = self.collect_with_info(samples_per_class, fixed, random);
 
         let mut fixed_samples = Vec::with_capacity(samples_per_class);
         let mut random_samples = Vec::with_capacity(samples_per_class);
@@ -283,7 +374,7 @@ impl Collector {
             }
         }
 
-        (fixed_samples, random_samples)
+        (fixed_samples, random_samples, batching_info)
     }
 }
 
@@ -321,7 +412,7 @@ mod tests {
         let collector = Collector::new(10);
 
         let counter = std::sync::atomic::AtomicU64::new(0);
-        let (fixed, random) = collector.collect_separated(
+        let (fixed, random, _batching) = collector.collect_separated(
             100,
             || counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             || counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -329,5 +420,232 @@ mod tests {
 
         assert_eq!(fixed.len(), 100);
         assert_eq!(random.len(), 100);
+    }
+
+    #[test]
+    fn test_unmeasurable_detection() {
+        // Test that extremely fast operations are detected as unmeasurable
+        let collector = Collector::new(10);
+
+        // A trivial operation that completes in near-zero time
+        let (_, batching) = collector.collect_with_info(
+            100,
+            || 42u8,  // Trivial constant return
+            || 42u8,
+        );
+
+        // On ARM (41ns resolution), this should be unmeasurable
+        // On x86 (0.3ns resolution), it might still measure
+        #[cfg(target_arch = "aarch64")]
+        {
+            // ARM timer has coarse resolution, trivial ops should be unmeasurable
+            if batching.ticks_per_batch < MIN_TICKS_SINGLE_CALL {
+                assert!(
+                    batching.unmeasurable.is_some(),
+                    "Expected unmeasurable for trivial op on ARM, got: {:?}",
+                    batching
+                );
+                let info = batching.unmeasurable.as_ref().unwrap();
+                assert!(info.ticks_per_call < MIN_TICKS_SINGLE_CALL);
+                assert!(batching.rationale.contains("UNMEASURABLE"));
+            }
+        }
+
+        // On any architecture, if unmeasurable is set, fields should be consistent
+        if let Some(ref info) = batching.unmeasurable {
+            assert!(info.ticks_per_call < MIN_TICKS_SINGLE_CALL);
+            assert!(info.threshold_ns > 0.0);
+            assert!(info.operation_ns >= 0.0);
+            assert!(!batching.enabled);
+            assert_eq!(batching.k, 1);
+        }
+    }
+
+    #[test]
+    fn test_batching_k_selection() {
+        // Test K selection logic with a controlled slow operation
+        let collector = Collector::new(10);
+
+        // Create an operation slow enough to be measurable but potentially need batching
+        let (_, batching) = collector.collect_with_info(
+            100,
+            || {
+                // Busy work to create measurable timing
+                let mut x = 0u64;
+                for i in 0..1000 {
+                    x = x.wrapping_add(black_box(i));
+                }
+                black_box(x)
+            },
+            || {
+                let mut x = 0u64;
+                for i in 0..1000 {
+                    x = x.wrapping_add(black_box(i));
+                }
+                black_box(x)
+            },
+        );
+
+        // If measurable, verify K selection logic
+        if batching.unmeasurable.is_none() {
+            // K should be at least 1
+            assert!(batching.k >= 1, "K should be at least 1");
+
+            // If batching enabled, K > 1
+            if batching.enabled {
+                assert!(batching.k > 1, "Batching enabled but K <= 1");
+            }
+
+            // K should never exceed MAX_BATCH_SIZE
+            assert!(
+                batching.k <= MAX_BATCH_SIZE,
+                "K {} exceeds MAX_BATCH_SIZE {}",
+                batching.k,
+                MAX_BATCH_SIZE
+            );
+
+            // ticks_per_batch should be reasonable
+            assert!(batching.ticks_per_batch > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_max_batch_size_cap() {
+        // Create a collector with very low max_batch_size
+        let timer = Timer::new();
+        let collector = Collector::with_max_batch_size(timer, 10, 5);
+
+        let (_, batching) = collector.collect_with_info(
+            100,
+            || black_box(42u8),
+            || black_box(42u8),
+        );
+
+        // K should never exceed the configured max_batch_size
+        assert!(
+            batching.k <= 5,
+            "K {} exceeded configured max_batch_size 5",
+            batching.k
+        );
+    }
+
+    #[test]
+    fn test_batching_disabled_for_slow_ops() {
+        // Test that slow operations don't get batched
+        let collector = Collector::new(10);
+
+        let (_, batching) = collector.collect_with_info(
+            50,
+            || {
+                // Slow operation: enough work to exceed TARGET_TICKS_PER_BATCH
+                let mut x = 0u64;
+                for i in 0..100_000 {
+                    x = x.wrapping_add(black_box(i));
+                }
+                std::hint::black_box(x)
+            },
+            || {
+                let mut x = 0u64;
+                for i in 0..100_000 {
+                    x = x.wrapping_add(black_box(i));
+                }
+                std::hint::black_box(x)
+            },
+        );
+
+        // A slow enough operation should not need batching
+        if batching.unmeasurable.is_none() && batching.ticks_per_batch >= TARGET_TICKS_PER_BATCH {
+            assert!(
+                !batching.enabled || batching.k == 1,
+                "Slow op should not need batching: {:?}",
+                batching
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_kperf_suggestion_on_macos_arm64() {
+        // On macOS ARM64, unmeasurable operations should suggest kperf
+        let collector = Collector::new(10);
+
+        let (_, batching) = collector.collect_with_info(
+            100,
+            || 42u8,  // Trivial op
+            || 42u8,
+        );
+
+        // If unmeasurable on macOS ARM64, should mention kperf
+        if batching.unmeasurable.is_some() {
+            assert!(
+                batching.rationale.contains("kperf") || batching.rationale.contains("macOS"),
+                "macOS ARM64 unmeasurable should mention kperf, got: {}",
+                batching.rationale
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn test_suggestion_on_linux_arm64() {
+        // On Linux ARM64, unmeasurable operations should suggest --features perf
+        let collector = Collector::new(10);
+
+        let (_, batching) = collector.collect_with_info(
+            100,
+            || 42u8,  // Trivial op
+            || 42u8,
+        );
+
+        // If unmeasurable on Linux ARM64, should mention perf feature
+        if batching.unmeasurable.is_some() {
+            assert!(
+                batching.rationale.contains("--features perf"),
+                "Linux ARM64 unmeasurable should mention --features perf, got: {}",
+                batching.rationale
+            );
+        }
+    }
+
+    #[test]
+    fn test_batching_info_consistency() {
+        // Verify BatchingInfo fields are internally consistent
+        let collector = Collector::new(10);
+
+        let (_, batching) = collector.collect_with_info(
+            100,
+            || {
+                let mut x = 0u64;
+                for i in 0..500 {
+                    x = x.wrapping_add(black_box(i));
+                }
+                black_box(x)
+            },
+            || {
+                let mut x = 0u64;
+                for i in 0..500 {
+                    x = x.wrapping_add(black_box(i));
+                }
+                black_box(x)
+            },
+        );
+
+        // enabled should match k > 1
+        assert_eq!(
+            batching.enabled,
+            batching.k > 1,
+            "enabled={} should match k > 1 (k={})",
+            batching.enabled,
+            batching.k
+        );
+
+        // rationale should not be empty
+        assert!(!batching.rationale.is_empty(), "rationale should not be empty");
+
+        // If unmeasurable, k should be 1 and enabled should be false
+        if batching.unmeasurable.is_some() {
+            assert_eq!(batching.k, 1, "unmeasurable should have k=1");
+            assert!(!batching.enabled, "unmeasurable should not be enabled");
+        }
     }
 }

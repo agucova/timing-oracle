@@ -145,7 +145,7 @@ pub fn cycles_per_ns() -> f64 {
         return 3.0;
     }
 
-    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ratios.sort_by(|a, b| a.total_cmp(b));
     let mid = ratios.len() / 2;
     if ratios.len() % 2 == 0 {
         (ratios[mid - 1] + ratios[mid]) / 2.0
@@ -162,15 +162,19 @@ fn estimate_resolution_ns(cycles_per_ns: f64) -> f64 {
     // Platform-specific known resolutions
     #[cfg(target_arch = "aarch64")]
     {
-        // Apple Silicon uses a 24.576 MHz virtual timer (cntvct_el0)
-        // Resolution = 1 / 24.576 MHz ≈ 40.69 ns
-        // We use cycles_per_ns to compute this dynamically
+        // ARM64 uses cntvct_el0 virtual timer. Frequency is IMPDEF before ARMv8.6,
+        // standardized to 1 GHz in ARMv8.6+. Examples:
+        // - Apple Silicon: 24 MHz (~42ns) - coarse
+        // - Ampere Altra: 25 MHz (~40ns) - coarse
+        // - AWS Graviton4 (ARMv9): 1 GHz (~1ns) - fine
+        // - Raspberry Pi 4: 54 MHz (~18ns) - moderate
+        // We detect resolution dynamically via cycles_per_ns calibration.
         if cycles_per_ns > 0.0 && cycles_per_ns < 0.1 {
-            // Low cycles/ns indicates ARM virtual timer (~0.024 cycles/ns on M1)
+            // Low cycles/ns indicates coarse timer (pre-ARMv8.6 or slow SoC)
             // Resolution is 1 tick in nanoseconds
             1.0 / cycles_per_ns
         } else {
-            // Empirical measurement
+            // High-frequency timer (ARMv8.6+ or empirical measurement)
             measure_timer_resolution(cycles_per_ns)
         }
     }
@@ -255,8 +259,9 @@ impl Timer {
 
     /// Get the estimated timer resolution in nanoseconds.
     ///
-    /// On x86_64, this is typically ~0.3-1ns (CPU frequency).
-    /// On Apple Silicon (aarch64), this is ~41ns (24 MHz virtual timer).
+    /// On x86_64, this is typically ~0.3-1ns (CPU frequency TSC).
+    /// On aarch64, this varies by SoC: ~1ns on ARMv8.6+ (Graviton4),
+    /// ~40ns on Apple Silicon/Ampere Altra, ~18ns on Raspberry Pi 4.
     pub fn resolution_ns(&self) -> f64 {
         self.resolution_ns
     }
@@ -371,8 +376,8 @@ mod tests {
     fn test_cycles_per_ns_reasonable() {
         let cpn = cycles_per_ns();
         // Should be between 0.01 GHz and 10 GHz
-        // Note: ARM timers (cntvct_el0) typically run at 24 MHz on Apple Silicon (0.024 cycles/ns)
-        // x86 TSC typically runs at CPU frequency (1-5 GHz)
+        // ARM64 cntvct_el0: 0.024-1.0 cycles/ns depending on SoC
+        // x86_64 TSC: 1-5 cycles/ns (CPU frequency)
         assert!(cpn > 0.01 && cpn < 10.0, "cycles_per_ns = {}", cpn);
     }
 
@@ -380,13 +385,15 @@ mod tests {
     fn test_timer_measure() {
         let timer = Timer::new();
         let cycles = timer.measure_cycles(|| {
+            // Use enough iterations to exceed timer resolution on all platforms
+            // ARM timer resolution is ~41ns, so we need > 41ns of work
             let mut sum = 0u64;
-            for i in 0..1000 {
-                sum = sum.wrapping_add(i);
+            for i in 0..100_000 {
+                sum = sum.wrapping_add(black_box(i));
             }
             black_box(sum)
         });
-        assert!(cycles > 0);
+        assert!(cycles > 0, "cycles should be positive, got {}", cycles);
     }
 
     #[test]
