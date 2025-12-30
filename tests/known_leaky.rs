@@ -4,7 +4,6 @@ use timing_oracle::TimingOracle;
 
 /// Test that early-exit comparison is detected as leaky.
 #[test]
-#[ignore = "requires full implementation"]
 fn detects_early_exit_comparison() {
     let secret = [0u8; 32];
 
@@ -28,7 +27,6 @@ fn detects_early_exit_comparison() {
 
 /// Test that branch-based timing is detected.
 #[test]
-#[ignore = "requires full implementation"]
 fn detects_branch_timing() {
     let result = TimingOracle::new()
         .samples(100_000)

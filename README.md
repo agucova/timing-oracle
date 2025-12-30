@@ -13,13 +13,32 @@ Unlike simple t-tests, this crate provides:
 ## Quick Start
 
 ```rust
+use std::cell::Cell;
 use timing_oracle::test;
 
 let secret = [0u8; 32];
 
+// CRITICAL: Both closures must execute IDENTICAL code paths.
+// Pre-generate inputs for BOTH classes - only the DATA differs.
+let fixed_inputs: Vec<[u8; 32]> = vec![[0u8; 32]; 100_000];    // All same
+let random_inputs: Vec<[u8; 32]> = (0..100_000)
+    .map(|_| rand_bytes())
+    .collect();
+
+// Shared index - both closures do identical Cell + Vec operations
+let idx = Cell::new(0usize);
+
 let result = test(
-    || compare(&secret, &[0u8; 32]),    // Fixed input (e.g., correct password)
-    || compare(&secret, &rand_bytes()), // Random inputs
+    || {
+        let i = idx.get();
+        idx.set(i.wrapping_add(1));
+        compare(&secret, &fixed_inputs[i % fixed_inputs.len()])
+    },
+    || {
+        let i = idx.get();
+        idx.set(i.wrapping_add(1));
+        compare(&secret, &random_inputs[i % random_inputs.len()])
+    },
 );
 
 if result.leak_probability > 0.9 {
@@ -34,6 +53,27 @@ if result.leak_probability > 0.9 {
 [dev-dependencies]
 timing-oracle = "0.1"
 ```
+
+## Build & Test
+
+```bash
+cargo build                     # Build the library
+cargo test                      # Run all tests (unit + integration)
+cargo test --lib                # Run only unit tests
+cargo test --test known_leaky   # Run leak detection tests
+cargo test --test known_safe    # Run false-positive tests
+cargo test --test calibration   # Run statistical calibration tests
+cargo nextest run               # Faster test runner
+cargo nextest run --profile timing # Single-threaded timing profile
+cargo build --features parallel # Enable rayon parallelism
+
+# Benchmarks (Criterion)
+cargo bench                    # Microbenchmarks of the timing pipeline (small sample sizes)
+```
+
+**Note:** Integration tests (`known_leaky`, `known_safe`, `calibration`) use 100k samples and may take several minutes. Use `TimingOracle::quick()` during development for faster iteration.
+
+If you're on Nix, `devenv shell` will bring in Rust toolchain + cargo-nextest/cargo-llvm-cov.
 
 ## The Problem
 
@@ -63,6 +103,10 @@ Existing tools like [dudect](https://github.com/oreparaz/dudect) detect such lea
 - Output t-statistics instead of interpretable probabilities
 - No bounded false positive rate for CI integration
 - Miss non-uniform timing effects (e.g., cache-related tail behavior)
+
+## Architecture
+
+For a detailed explanation of the internal architecture, statistical methodology, and implementation decisions, see [`docs/architecture.md`](docs/architecture.md).
 
 ## How It Works
 
@@ -136,9 +180,30 @@ let result = TimingOracle::new()
     .samples(100_000)           // Samples per class
     .warmup(1_000)              // Warmup iterations
     .ci_alpha(0.01)             // CI false positive rate
-    .min_effect_of_concern(10.0) // Ignore effects < 10ns
+    .effect_prior_ns(10.0)      // Prior scale for effects (not a hard cutoff)
     .test(fixed_fn, random_fn);
 ```
+
+### CI-focused builder
+
+```rust
+#[test]
+fn compare_is_constant_time() {
+    use timing_oracle::{Mode, TimingOracle};
+
+    TimingOracle::ci_test()
+        .from_env() // TO_MODE/TO_SAMPLES/TO_ALPHA/TO_REPORT/TO_SEED/...
+        .mode(Mode::Smoke)
+        .fail_on(timing_oracle::FailCriterion::CiGate)
+        .run(
+            || fixed_compare(&FIXED),
+            || random_compare(&rand_input()),
+        )
+        .unwrap_or_report();
+}
+```
+
+For async workloads, call `.async_workload(true)` or set `TO_ASYNC_WORKLOAD=1` to inflate priors/thresholds for higher noise and log the async flag.
 
 ### Test Result
 
@@ -276,6 +341,301 @@ fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
 }
 ```
 
+## Advanced Examples
+
+### Testing with State
+
+For tests that need shared state or complex setup:
+
+```rust
+use timing_oracle::TimingOracle;
+
+// Example: Testing database query timing
+fn test_db_query_timing() {
+    let result = TimingOracle::new()
+        .samples(10_000)
+        .test_with_state(
+            || {
+                // Setup: Initialize database connection
+                let db = Database::connect("test.db");
+                db.create_table();
+                db
+            },
+            |db| {
+                // Fixed input: Known user ID (might trigger caching)
+                db.prepare_query("SELECT * FROM users WHERE id = ?", 1)
+            },
+            |db, rng| {
+                // Random input: Random user ID
+                let user_id = rng.gen_range(1..1000);
+                db.prepare_query("SELECT * FROM users WHERE id = ?", user_id)
+            },
+            |db, query| {
+                // Execute the query
+                db.execute(query);
+            },
+        );
+
+    assert!(result.ci_gate.passed,
+            "Database query should not leak user ID through timing");
+}
+```
+
+### Quick Smoke Tests
+
+For faster iteration during development:
+
+```rust
+use timing_oracle::TimingOracle;
+
+// Fast test with reduced samples (completes in ~0.5s)
+let result = TimingOracle::quick()  // 5k samples, reduced bootstrap
+    .test(|| my_function(&FIXED), || my_function(&random_input()));
+
+println!("Quick smoke test: {:.0}% probability",
+         result.leak_probability * 100.0);
+```
+
+### Reusing Calibrated Timer
+
+When running many tests (e.g., in calibration studies), reuse a single timer to avoid repeated calibration overhead (~50ms per test):
+
+```rust
+use timing_oracle::{Timer, TimingOracle};
+
+let timer = Timer::new();  // Calibrate once
+
+for _ in 0..100 {
+    let result = TimingOracle::quick()
+        .with_timer(timer.clone())  // Reuse calibration
+        .test(|| operation1(), || operation2());
+
+    // Process results...
+}
+```
+
+### Interpreting Results
+
+```rust
+let result = TimingOracle::new().test(fixed_fn, random_fn);
+
+// 1. Check CI gate for pass/fail decision
+if !result.ci_gate.passed {
+    println!("❌ CI gate failed - timing leak detected");
+}
+
+// 2. Examine leak probability
+match result.leak_probability {
+    p if p > 0.99 => println!("🔴 Virtually certain leak (>99%)"),
+    p if p > 0.9  => println!("🟠 Very likely leak (>90%)"),
+    p if p > 0.5  => println!("🟡 Probable leak (>50%)"),
+    _             => println!("🟢 No significant leak detected"),
+}
+
+// 3. If leak detected, examine effect decomposition
+if let Some(effect) = result.effect {
+    println!("Effect breakdown:");
+    println!("  Shift: {:.1} ns ({:?})", effect.shift_ns, effect.pattern);
+    println!("  Tail:  {:.1} ns", effect.tail_ns);
+    println!("  Total magnitude: {:.1}-{:.1} ns (95% CI)",
+             effect.credible_interval_ns.0,
+             effect.credible_interval_ns.1);
+}
+
+// 4. Check exploitability
+match result.exploitability {
+    Exploitability::Negligible =>
+        println!("Not practically exploitable"),
+    Exploitability::PossibleLAN =>
+        println!("⚠️  Might be exploitable on LAN (~100k queries)"),
+    Exploitability::LikelyLAN =>
+        println!("⚠️  Likely exploitable on LAN (~10k queries)"),
+    Exploitability::PossibleRemote =>
+        println!("⚠️  Possibly exploitable remotely"),
+}
+
+// 5. Assess measurement quality
+println!("Measurement quality: {:?}", result.quality);
+println!("Min detectable effect: {:.1} ns (shift), {:.1} ns (tail)",
+         result.min_detectable_effect.shift_ns,
+         result.min_detectable_effect.tail_ns);
+```
+
+## Troubleshooting
+
+### High Noise / "TooNoisy" Quality
+
+**Symptoms:**
+- `quality: TooNoisy` or `Poor`
+- High `min_detectable_effect` (>100 ns)
+- Unreliable results
+
+**Solutions:**
+1. **Increase sample count:**
+   ```rust
+   TimingOracle::new().samples(500_000)  // vs default 100k
+   ```
+
+2. **Check CPU governor (Linux):**
+   ```bash
+   cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+   # Should be "performance", not "powersave"
+   sudo cpupower frequency-set -g performance
+   ```
+
+3. **Disable turbo boost:**
+   ```bash
+   echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+   ```
+
+4. **Run on isolated CPU cores:**
+   ```bash
+   cargo test --test timing_tests -- --test-threads=1
+   ```
+
+5. **Check for background processes:**
+   - Close unnecessary applications
+   - Verify low system load with `top` or `htop`
+
+### False Positives on Noise
+
+**Symptoms:**
+- Constant-time code flagged as leaky
+- `leak_probability` high on XOR operations
+
+**Solutions:**
+1. **Tighten CI alpha:**
+   ```rust
+   TimingOracle::new().ci_alpha(0.001)  // vs default 0.01
+   ```
+
+2. **Run sanity check manually:**
+   ```rust
+   // Split fixed samples in half - should not detect leak
+   let result = TimingOracle::new()
+       .test(|| my_fixed_op(), || my_fixed_op());
+
+   assert!(result.ci_gate.passed, "Sanity check failed!");
+   ```
+
+3. **Check preflight warnings** - they'll indicate environmental issues
+
+### Unable to Detect Known Leaks
+
+**Symptoms:**
+- Early-exit comparison shows `leak_probability < 0.5`
+- CI gate passes on leaky code
+
+**Solutions:**
+1. **Increase sample count:**
+   ```rust
+   TimingOracle::new().samples(500_000)
+   ```
+
+2. **Ensure sufficient timing difference:**
+   - Small leaks (<10ns) may require very large sample sizes
+   - Verify leak is visible in raw timing data:
+     ```rust
+     // Manual inspection
+     let mut fixed_times = vec![];
+     let mut random_times = vec![];
+     for _ in 0..1000 {
+         let timer = Timer::new();
+         fixed_times.push(timer.measure_cycles(|| fixed_op()));
+         random_times.push(timer.measure_cycles(|| random_op()));
+     }
+     println!("Fixed median: {}", median(&fixed_times));
+     println!("Random median: {}", median(&random_times));
+     ```
+
+3. **Disable compiler optimizations in test:**
+   ```rust
+   use std::hint::black_box;
+
+   let result = TimingOracle::new().test(
+       || black_box(my_function(black_box(&fixed_input))),
+       || black_box(my_function(black_box(&random_input()))),
+   );
+   ```
+
+### Virtual Machine Issues
+
+**Symptoms:**
+- Extremely high noise
+- Unreliable timing
+- Preflight warnings about VM
+
+**Solutions:**
+- Run tests on bare metal when possible
+- If VM required, ensure:
+  - Dedicated CPU cores (no overcommit)
+  - Nested virtualization disabled
+  - High-resolution timer support enabled
+
+### Handling Test Flakiness
+
+If tests occasionally fail/pass inconsistently:
+
+```rust
+use timing_oracle::{Mode, FailCriterion};
+
+// Use hierarchical thresholds
+TimingOracle::ci_test()
+    .mode(Mode::Full)
+    .fail_on(FailCriterion::Either {
+        probability: 0.99,  // Very high bar
+    })
+    .run(fixed_fn, random_fn)
+    .unwrap_or_report();
+
+// Or require both gate AND probability
+TimingOracle::ci_test()
+    .fail_on(FailCriterion::Both {
+        probability: 0.9,
+    })
+    .run(fixed_fn, random_fn)
+    .unwrap_or_report();
+```
+
+## Performance Tips
+
+### Typical Runtime
+
+For default configuration (100k samples):
+- **Measurement time:** Depends on operation cost
+  - Fast operation (10ns): ~2 seconds
+  - Medium operation (100ns): ~20 seconds
+  - Slow operation (1μs): ~200 seconds
+- **Analysis overhead:** <1 second (bootstrap + Bayesian inference)
+
+### Optimization Strategies
+
+1. **Start with quick mode during development:**
+   ```rust
+   TimingOracle::quick()  // 5k samples, ~10x faster
+   ```
+
+2. **Use parallel feature for bootstrap:**
+   ```toml
+   [dependencies]
+   timing-oracle = { version = "0.1", features = ["parallel"] }
+   ```
+   Speedup: ~2-3× on 8-core machines
+
+3. **Reduce bootstrap iterations for faster CI:**
+   ```rust
+   TimingOracle::new()
+       .ci_bootstrap_iterations(2_000)    // vs 10k default
+       .cov_bootstrap_iterations(500)     // vs 2k default
+   ```
+
+4. **Adjust calibration fraction:**
+   ```rust
+   TimingOracle::new()
+       .calibration_fraction(0.2)  // vs 0.3 default
+       // More data for inference, less for calibration
+   ```
+
 ## Configuration
 
 | Parameter | Default | Description |
@@ -283,9 +643,13 @@ fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
 | `samples` | 100,000 | Samples per class |
 | `warmup` | 1,000 | Warmup iterations (not measured) |
 | `ci_alpha` | 0.01 | CI gate false positive rate |
-| `min_effect_of_concern_ns` | 10.0 | Effects below this are considered negligible |
+| `effect_prior_ns` | 10.0 | Prior scale for effects (σ_μ), not a pass/fail threshold |
+| `effect_threshold_ns` | _unset_ | Optional hard threshold for reporting/panic |
 | `outlier_percentile` | 0.999 | Percentile for outlier filtering (1.0 = disabled) |
 | `prior_no_leak` | 0.75 | Prior probability of no leak |
+| `calibration_fraction` | 0.3 | Fraction of samples used for calibration/preflight |
+| `max_duration_ms` | _unset_ | Optional guardrail to abort long runs |
+| `measurement_seed` | _unset_ | Deterministic seed for measurement randomness |
 
 ## Statistical Details
 

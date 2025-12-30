@@ -12,11 +12,14 @@ pub struct Config {
     /// False positive rate for CI gate (default: 0.01).
     pub ci_alpha: f64,
 
-    /// Minimum effect size of concern in nanoseconds (default: 10.0).
+    /// Minimum effect size we care about in nanoseconds (default: 10.0).
     ///
     /// Effects smaller than this won't trigger high posterior probabilities
     /// even if statistically detectable. This encodes practical relevance.
     pub min_effect_of_concern_ns: f64,
+
+    /// Optional hard effect threshold in nanoseconds for reporting/panic.
+    pub effect_threshold_ns: Option<f64>,
 
     /// Bootstrap iterations for CI thresholds (default: 10,000).
     pub ci_bootstrap_iterations: usize,
@@ -30,6 +33,15 @@ pub struct Config {
 
     /// Prior probability of no leak (default: 0.75).
     pub prior_no_leak: f64,
+
+    /// Fraction of samples held out for calibration/preflight (default: 0.3).
+    pub calibration_fraction: f32,
+
+    /// Optional guardrail for max duration in milliseconds.
+    pub max_duration_ms: Option<u64>,
+
+    /// Optional deterministic seed for measurement randomness.
+    pub measurement_seed: Option<u64>,
 }
 
 impl Default for Config {
@@ -39,10 +51,14 @@ impl Default for Config {
             warmup: 1_000,
             ci_alpha: 0.01,
             min_effect_of_concern_ns: 10.0,
-            ci_bootstrap_iterations: 10_000,
-            cov_bootstrap_iterations: 2_000,
+            effect_threshold_ns: None,
+            ci_bootstrap_iterations: 500,  // Reduced from 10,000 for practical runtime
+            cov_bootstrap_iterations: 200, // Reduced from 2,000 for practical runtime
             outlier_percentile: 0.999,
             prior_no_leak: 0.75,
+            calibration_fraction: 0.3,
+            max_duration_ms: None,
+            measurement_seed: None,
         }
     }
 }

@@ -119,32 +119,39 @@ fn rdtsc_fallback() -> u64 {
 /// The estimated number of cycles per nanosecond. For a 3 GHz CPU,
 /// this would return approximately 3.0.
 pub fn cycles_per_ns() -> f64 {
-    const CALIBRATION_MS: u64 = 10;
-    const CALIBRATION_ITERATIONS: u32 = 5;
+    const CALIBRATION_MS: u64 = 1;
+    const CALIBRATION_ITERATIONS: usize = 100;
 
-    let mut total_cycles = 0u64;
-    let mut total_nanos = 0u64;
+    let mut ratios = Vec::with_capacity(CALIBRATION_ITERATIONS);
 
     for _ in 0..CALIBRATION_ITERATIONS {
         let start_cycles = rdtsc();
         let start_time = Instant::now();
 
-        // Busy wait for calibration period
         std::thread::sleep(std::time::Duration::from_millis(CALIBRATION_MS));
 
         let end_cycles = rdtsc();
         let elapsed_nanos = start_time.elapsed().as_nanos() as u64;
 
-        total_cycles += end_cycles.saturating_sub(start_cycles);
-        total_nanos += elapsed_nanos;
+        if elapsed_nanos == 0 {
+            continue;
+        }
+
+        let cycles = end_cycles.saturating_sub(start_cycles);
+        ratios.push(cycles as f64 / elapsed_nanos as f64);
     }
 
-    if total_nanos == 0 {
-        // Fallback to a reasonable default (3 GHz)
+    if ratios.is_empty() {
         return 3.0;
     }
 
-    total_cycles as f64 / total_nanos as f64
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = ratios.len() / 2;
+    if ratios.len() % 2 == 0 {
+        (ratios[mid - 1] + ratios[mid]) / 2.0
+    } else {
+        ratios[mid]
+    }
 }
 
 /// High-level timer for measuring function execution.
@@ -229,8 +236,10 @@ mod tests {
     #[test]
     fn test_cycles_per_ns_reasonable() {
         let cpn = cycles_per_ns();
-        // Should be between 0.1 GHz and 10 GHz
-        assert!(cpn > 0.1 && cpn < 10.0, "cycles_per_ns = {}", cpn);
+        // Should be between 0.01 GHz and 10 GHz
+        // Note: ARM timers (cntvct_el0) typically run at 24 MHz on Apple Silicon (0.024 cycles/ns)
+        // x86 TSC typically runs at CPU frequency (1-5 GHz)
+        assert!(cpn > 0.01 && cpn < 10.0, "cycles_per_ns = {}", cpn);
     }
 
     #[test]

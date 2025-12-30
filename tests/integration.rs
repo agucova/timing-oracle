@@ -1,6 +1,6 @@
 //! End-to-end integration tests.
 
-use timing_oracle::{test, Config, TimingOracle};
+use timing_oracle::TimingOracle;
 
 /// Basic smoke test that the API works.
 #[test]
@@ -22,7 +22,7 @@ fn builder_api() {
         .samples(1000)
         .warmup(100)
         .ci_alpha(0.05)
-        .min_effect_of_concern(5.0)
+        .effect_prior_ns(5.0)
         .outlier_percentile(0.99);
 
     let config = oracle.config();
@@ -35,10 +35,12 @@ fn builder_api() {
 /// Test convenience function.
 #[test]
 fn convenience_function() {
-    let result = test(
-        || std::hint::black_box(42),
-        || std::hint::black_box(42),
-    );
+    let result = TimingOracle::new()
+        .samples(200)
+        .test(
+            || std::hint::black_box(42),
+            || std::hint::black_box(42),
+        );
 
     assert!(result.leak_probability >= 0.0);
     assert!(result.leak_probability <= 1.0);

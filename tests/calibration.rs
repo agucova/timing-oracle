@@ -1,22 +1,27 @@
 //! Calibration tests to verify statistical properties.
+//!
+//! These tests use `TimingOracle::quick()` with a cached timer for fast execution.
 
-use timing_oracle::TimingOracle;
+use timing_oracle::{Timer, TimingOracle};
 
 /// Verify CI gate false positive rate is bounded.
 ///
 /// Run many trials on pure noise data and check rejection rate <= 2*alpha.
 #[test]
-#[ignore = "requires full implementation and is slow"]
 fn ci_gate_fpr_calibration() {
     const TRIALS: usize = 100;
     const ALPHA: f64 = 0.01;
+
+    // Calibrate timer once, reuse across all trials (~5s saved)
+    let timer = Timer::new();
 
     let mut rejections = 0;
 
     for _ in 0..TRIALS {
         // Pure noise: both classes are random
-        let result = TimingOracle::new()
-            .samples(10_000)
+        let result = TimingOracle::quick()
+            .with_timer(timer.clone())
+            .samples(5_000)
             .ci_alpha(ALPHA)
             .test(|| rand_bytes(), || rand_bytes());
 
@@ -36,15 +41,17 @@ fn ci_gate_fpr_calibration() {
 
 /// Verify Bayesian layer doesn't over-concentrate on high probabilities for null data.
 #[test]
-#[ignore = "requires full implementation and is slow"]
 fn bayesian_calibration() {
     const TRIALS: usize = 100;
+
+    // Calibrate timer once, reuse across all trials
+    let timer = Timer::new();
 
     let mut high_prob_count = 0;
 
     for _ in 0..TRIALS {
-        let result = TimingOracle::new()
-            .samples(10_000)
+        let result = TimingOracle::quick()
+            .with_timer(timer.clone())
             .test(|| rand_bytes(), || rand_bytes());
 
         if result.leak_probability > 0.9 {

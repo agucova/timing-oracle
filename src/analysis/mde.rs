@@ -51,18 +51,16 @@ impl From<MdeEstimate> for MinDetectableEffect {
 /// # Arguments
 ///
 /// * `covariance` - Pooled covariance matrix of quantile differences
-/// * `n_samples` - Sample size per class
 /// * `n_simulations` - Number of null simulations (default: 1000)
-/// * `prior_var` - Prior variance for effect decomposition
+/// * `prior_sigmas` - Prior standard deviations for effect decomposition
 ///
 /// # Returns
 ///
 /// An `MdeEstimate` with shift and tail MDE in nanoseconds.
 pub fn estimate_mde(
     covariance: &Matrix9,
-    n_samples: usize,
     n_simulations: usize,
-    prior_var: f64,
+    prior_sigmas: (f64, f64),
 ) -> MdeEstimate {
     let mut rng = rand::rng();
 
@@ -72,10 +70,10 @@ pub fn estimate_mde(
 
     for _ in 0..n_simulations {
         // Sample from null distribution
-        let null_sample = sample_null_mvn(covariance, n_samples, &mut rng);
+        let null_sample = sample_null_mvn(covariance, &mut rng);
 
         // Fit effect model
-        let decomp = decompose_effect(&null_sample, covariance, n_samples, prior_var);
+        let decomp = decompose_effect(&null_sample, covariance, prior_sigmas);
 
         // Collect absolute effects
         shift_effects.push(decomp.posterior_mean[0].abs());
@@ -97,16 +95,13 @@ pub fn estimate_mde(
 ///
 /// Uses the Cholesky decomposition: if L*L^T = Sigma, then
 /// L * z ~ MVN(0, Sigma) when z ~ N(0, I).
-fn sample_null_mvn<R: Rng>(covariance: &Matrix9, n_samples: usize, rng: &mut R) -> Vector9 {
-    // Compute Cholesky decomposition
-    let scaled_cov = covariance / (n_samples as f64);
-
+fn sample_null_mvn<R: Rng>(covariance: &Matrix9, rng: &mut R) -> Vector9 {
     // TODO: Cache Cholesky decomposition across samples for efficiency
-    let chol = match nalgebra::Cholesky::new(scaled_cov) {
+    let chol = match nalgebra::Cholesky::new(*covariance) {
         Some(c) => c,
         None => {
             // Regularize if not positive definite
-            let regularized = scaled_cov + Matrix9::identity() * 1e-10;
+            let regularized = covariance + Matrix9::identity() * 1e-10;
             nalgebra::Cholesky::new(regularized)
                 .expect("Regularized covariance should be positive definite")
         }
@@ -138,8 +133,9 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
 /// Estimate MDE with default parameters.
 ///
 /// Uses 1000 simulations and a weak prior (variance = 1e6).
-pub fn estimate_mde_default(covariance: &Matrix9, n_samples: usize) -> MdeEstimate {
-    estimate_mde(covariance, n_samples, 1000, 1e6)
+pub fn estimate_mde_default(covariance: &Matrix9) -> MdeEstimate {
+    let prior_sigmas = (1e3, 1e3);
+    estimate_mde(covariance, 1000, prior_sigmas)
 }
 
 #[cfg(test)]
@@ -163,28 +159,11 @@ mod tests {
     fn test_mde_positive() {
         // With identity covariance, MDE should be positive
         let cov = Matrix9::identity();
-        let mde = estimate_mde(&cov, 100, 100, 1e6);
+        let mde = estimate_mde(&cov, 100, (1e3, 1e3));
 
         assert!(mde.shift_ns > 0.0, "MDE shift should be positive");
         assert!(mde.tail_ns > 0.0, "MDE tail should be positive");
     }
 
-    #[test]
-    fn test_mde_decreases_with_samples() {
-        let cov = Matrix9::identity();
-
-        // MDE with fewer samples
-        let mde_small = estimate_mde(&cov, 100, 100, 1e6);
-
-        // MDE with more samples
-        let mde_large = estimate_mde(&cov, 10000, 100, 1e6);
-
-        // More samples should generally lead to smaller MDE
-        // (Note: due to randomness, this isn't guaranteed for small n_simulations)
-        // This is a weak test that checks the right order of magnitude
-        assert!(
-            mde_large.shift_ns < mde_small.shift_ns * 2.0,
-            "MDE should not increase dramatically with more samples"
-        );
-    }
+    // Sample-size scaling is handled by the covariance estimate; no direct test here.
 }

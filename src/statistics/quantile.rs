@@ -74,7 +74,7 @@ pub fn compute_quantile(data: &mut [f64], p: f64) -> f64 {
 /// Compute all 9 deciles [0.1, 0.2, ..., 0.9] from timing measurements.
 ///
 /// Returns a Vector9 containing the quantile values at each decile.
-/// The input slice is cloned internally to avoid mutation.
+/// The input slice is cloned and sorted once for efficiency.
 ///
 /// # Arguments
 ///
@@ -91,16 +91,27 @@ pub fn compute_quantile(data: &mut [f64], p: f64) -> f64 {
 pub fn compute_deciles(data: &[f64]) -> Vector9 {
     assert!(!data.is_empty(), "Cannot compute deciles of empty slice");
 
-    let mut working_copy = data.to_vec();
+    // Sort once, then compute all quantiles from sorted data - O(n log n) total
+    let mut sorted = data.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = sorted.len();
     let mut result = Vector9::zeros();
 
     for (i, &p) in DECILES.iter().enumerate() {
-        // TODO: Optimize by computing all quantiles in a single pass
-        // Currently each quantile computation may partially reorder the data
-        result[i] = compute_quantile(&mut working_copy, p);
+        // Compute index using R-7 quantile definition (linear interpolation)
+        let h = (n - 1) as f64 * p;
+        let h_floor = h.floor() as usize;
+        let h_frac = h - h.floor();
 
-        // Reset working copy for next quantile (inefficient but correct)
-        working_copy.copy_from_slice(data);
+        if h_floor >= n - 1 {
+            result[i] = sorted[n - 1];
+        } else if h_frac == 0.0 {
+            result[i] = sorted[h_floor];
+        } else {
+            // Linear interpolation
+            result[i] = sorted[h_floor] + h_frac * (sorted[h_floor + 1] - sorted[h_floor]);
+        }
     }
 
     result

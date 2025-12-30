@@ -29,6 +29,7 @@
 // Core modules
 mod config;
 mod constants;
+pub mod ci;
 mod oracle;
 mod result;
 mod types;
@@ -43,11 +44,13 @@ pub mod statistics;
 // Re-exports for public API
 pub use config::Config;
 pub use constants::{B_TAIL, DECILES, LOG_2PI, ONES};
+pub use measurement::Timer;
 pub use oracle::TimingOracle;
 pub use result::{
     CiGate, Effect, EffectPattern, Exploitability, MeasurementQuality, Metadata,
     MinDetectableEffect, TestResult,
 };
+pub use ci::{CiFailure, CiRunOutcome, CiTestBuilder, FailCriterion, Mode};
 pub use types::{Class, Matrix9, Matrix9x2, Vector9};
 
 /// Convenience function for simple timing tests with default configuration.
@@ -69,4 +72,48 @@ where
     R: FnMut() -> T,
 {
     TimingOracle::new().test(fixed, random)
+}
+
+/// Declarative timing test macro.
+///
+/// Generates a #[test] that fails if leak_probability > 0.9.
+#[cfg(feature = "macros")]
+#[macro_export]
+macro_rules! timing_test {
+    ($name:ident {
+        setup: $setup:block,
+        fixed: $fixed:expr,
+        random: $random:expr,
+        test: $test:expr $(,)?
+    }) => {
+        #[test]
+        fn $name() {
+            let setup_fn = || $setup;
+            let result = $crate::TimingOracle::new()
+                .test_with_state(setup_fn, $fixed, $random, $test);
+
+            assert!(
+                result.leak_probability <= 0.9,
+                "timing leak detected: probability {:.2}",
+                result.leak_probability
+            );
+        }
+    };
+    ($name:ident {
+        fixed: $fixed:expr,
+        random: $random:expr,
+        test: $test:expr $(,)?
+    }) => {
+        #[test]
+        fn $name() {
+            let _ = $test;
+            let result = $crate::TimingOracle::new().test($fixed, $random);
+
+            assert!(
+                result.leak_probability <= 0.9,
+                "timing leak detected: probability {:.2}",
+                result.leak_probability
+            );
+        }
+    };
 }

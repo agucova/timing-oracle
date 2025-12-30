@@ -15,6 +15,7 @@
 //! - epsilon ~ MVN(0, Sigma) is noise
 
 use nalgebra::Cholesky;
+use rand_distr::{Distribution, StandardNormal};
 
 use crate::constants::{B_TAIL, ONES};
 use crate::result::EffectPattern;
@@ -31,6 +32,8 @@ pub struct EffectDecomposition {
     pub shift_ci: (f64, f64),
     /// 95% credible interval for tail effect.
     pub tail_ci: (f64, f64),
+    /// 95% credible interval for total effect magnitude.
+    pub effect_magnitude_ci: (f64, f64),
     /// Classified effect pattern.
     pub pattern: EffectPattern,
 }
@@ -46,8 +49,7 @@ pub struct EffectDecomposition {
 ///
 /// * `observed_diff` - Observed quantile differences (9-vector)
 /// * `covariance` - Covariance matrix of differences (9x9)
-/// * `n_samples` - Sample size (for scaling)
-/// * `prior_var` - Prior variance on effects (e.g., 1000.0 for weak prior)
+/// * `prior_sigmas` - Prior standard deviations (shift, tail) in nanoseconds
 ///
 /// # Returns
 ///
@@ -55,18 +57,14 @@ pub struct EffectDecomposition {
 pub fn decompose_effect(
     observed_diff: &Vector9,
     covariance: &Matrix9,
-    n_samples: usize,
-    prior_var: f64,
+    prior_sigmas: (f64, f64),
 ) -> EffectDecomposition {
     // Build design matrix X = [ones | b_tail]
     let design_matrix = build_design_matrix();
 
-    // Scale covariance by sample size
-    let scaled_cov = covariance / (n_samples as f64);
-
     // Compute posterior using Bayesian linear regression
     let (posterior_mean, posterior_cov) =
-        bayesian_linear_regression(&design_matrix, observed_diff, &scaled_cov, prior_var);
+        bayesian_linear_regression(&design_matrix, observed_diff, covariance, prior_sigmas);
 
     // Compute 95% credible intervals
     let shift_ci = compute_credible_interval(posterior_mean[0], posterior_cov[(0, 0)]);
@@ -75,11 +73,15 @@ pub fn decompose_effect(
     // Classify the effect pattern
     let pattern = classify_pattern(&posterior_mean, &posterior_cov);
 
+    // Compute effect magnitude CI from posterior samples
+    let effect_magnitude_ci = sample_effect_magnitude_ci(&posterior_mean, &posterior_cov, 5000);
+
     EffectDecomposition {
         posterior_mean,
         posterior_cov,
         shift_ci,
         tail_ci,
+        effect_magnitude_ci,
         pattern,
     }
 }
@@ -109,7 +111,7 @@ fn bayesian_linear_regression(
     design: &Matrix9x2,
     observed: &Vector9,
     covariance: &Matrix9,
-    prior_var: f64,
+    prior_sigmas: (f64, f64),
 ) -> (Vector2, Matrix2) {
     // Compute Cholesky of covariance for efficient inversion
     let chol = match Cholesky::new(*covariance) {
@@ -132,8 +134,11 @@ fn bayesian_linear_regression(
     // X^T * Sigma^-1 * y
     let xt_sigma_inv_y = design.transpose() * sigma_inv_y;
 
-    // Prior precision
-    let prior_precision = Matrix2::identity() / prior_var;
+    // Prior precision: diag(1/sigma^2)
+    let (sigma_mu, sigma_tau) = prior_sigmas;
+    let mut prior_precision = Matrix2::zeros();
+    prior_precision[(0, 0)] = 1.0 / sigma_mu.max(1e-12).powi(2);
+    prior_precision[(1, 1)] = 1.0 / sigma_tau.max(1e-12).powi(2);
 
     // Posterior precision: X^T Sigma^-1 X + prior precision
     let posterior_precision = xt_sigma_inv_x + prior_precision;
@@ -143,7 +148,7 @@ fn bayesian_linear_regression(
         Some(c) => c.inverse(),
         None => {
             // Fallback to large variance if inversion fails
-            Matrix2::identity() * prior_var
+            Matrix2::identity() * 1e6
         }
     };
 
@@ -174,6 +179,41 @@ fn compute_credible_interval(mean: f64, variance: f64) -> (f64, f64) {
     let std = variance.sqrt();
     let z = 1.96;
     (mean - z * std, mean + z * std)
+}
+
+/// Sample posterior to estimate CI of total effect magnitude.
+fn sample_effect_magnitude_ci(
+    posterior_mean: &Vector2,
+    posterior_cov: &Matrix2,
+    n_samples: usize,
+) -> (f64, f64) {
+    let chol = match Cholesky::new(*posterior_cov) {
+        Some(c) => c,
+        None => {
+            let regularized = posterior_cov + Matrix2::identity() * 1e-12;
+            Cholesky::new(regularized).expect("Regularized covariance should be positive definite")
+        }
+    };
+
+    let mut rng = rand::rng();
+    let mut magnitudes = Vec::with_capacity(n_samples);
+
+    for _ in 0..n_samples {
+        let z0: f64 = StandardNormal.sample(&mut rng);
+        let z1: f64 = StandardNormal.sample(&mut rng);
+        let z = Vector2::new(z0, z1);
+        let sample = posterior_mean + chol.l() * z;
+        let magnitude = (sample[0].powi(2) + sample[1].powi(2)).sqrt();
+        magnitudes.push(magnitude);
+    }
+
+    magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo_idx = ((n_samples as f64) * 0.025).round() as usize;
+    let hi_idx = ((n_samples as f64) * 0.975).round() as usize;
+    let lo = magnitudes[lo_idx.min(n_samples - 1)];
+    let hi = magnitudes[hi_idx.min(n_samples - 1)];
+
+    (lo, hi)
 }
 
 /// Classify the effect pattern based on posterior estimates.

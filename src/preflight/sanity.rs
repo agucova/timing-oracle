@@ -7,6 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::{compute_bayes_factor, estimate_mde, run_ci_gate, CiGateInput};
+use crate::statistics::{bootstrap_covariance_matrix, compute_deciles};
+use crate::types::Vector9;
+
 /// Warning from the sanity check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SanityWarning {
@@ -62,6 +66,12 @@ const MIN_SAMPLES_FOR_SANITY: usize = 1000;
 /// Threshold for leak probability to trigger warning.
 const LEAK_THRESHOLD: f64 = 0.5;
 
+/// Default alpha for sanity check.
+const SANITY_ALPHA: f64 = 0.01;
+
+/// Default bootstrap iterations for sanity check.
+const SANITY_BOOTSTRAP: usize = 1000;
+
 /// Perform Fixed-vs-Fixed sanity check.
 ///
 /// Splits the fixed samples in half and runs analysis between the halves.
@@ -88,12 +98,7 @@ pub fn sanity_check(fixed_samples: &[f64]) -> Option<SanityWarning> {
     let first_half = &fixed_samples[..mid];
     let second_half = &fixed_samples[mid..];
 
-    // TODO: Run the actual analysis between the two halves.
-    // This requires access to the analysis module which computes
-    // quantile differences and Bayesian model comparison.
-    //
-    // For now, we compute a simplified check using basic statistics.
-    let leak_probability = compute_simplified_leak_check(first_half, second_half);
+    let leak_probability = compute_full_leak_check(first_half, second_half);
 
     if leak_probability > LEAK_THRESHOLD {
         Some(SanityWarning::BrokenHarness { leak_probability })
@@ -102,37 +107,43 @@ pub fn sanity_check(fixed_samples: &[f64]) -> Option<SanityWarning> {
     }
 }
 
-/// Simplified leak check using basic statistics.
-///
-/// TODO: Replace with proper quantile-based analysis once the
-/// analysis module interface is available.
-fn compute_simplified_leak_check(first: &[f64], second: &[f64]) -> f64 {
+/// Full leak check using the core quantile-based analysis pipeline.
+fn compute_full_leak_check(first: &[f64], second: &[f64]) -> f64 {
     if first.is_empty() || second.is_empty() {
         return 0.0;
     }
 
-    // Compute means
-    let mean1: f64 = first.iter().sum::<f64>() / first.len() as f64;
-    let mean2: f64 = second.iter().sum::<f64>() / second.len() as f64;
+    let q_first = compute_deciles(first);
+    let q_second = compute_deciles(second);
+    let delta: Vector9 = q_first - q_second;
 
-    // Compute pooled standard deviation
-    let var1: f64 = first.iter().map(|x| (x - mean1).powi(2)).sum::<f64>() / first.len() as f64;
-    let var2: f64 = second.iter().map(|x| (x - mean2).powi(2)).sum::<f64>() / second.len() as f64;
+    let cov_first = bootstrap_covariance_matrix(first, SANITY_BOOTSTRAP, 123);
+    let cov_second = bootstrap_covariance_matrix(second, SANITY_BOOTSTRAP, 456);
+    let sigma0 = cov_first.matrix + cov_second.matrix;
 
-    let pooled_std = ((var1 + var2) / 2.0).sqrt();
+    let mde = estimate_mde(&sigma0, 200, (1e6, 1e6));
+    let min_effect = 10.0;
+    let prior_sigmas = (
+        (2.0 * mde.shift_ns).max(min_effect),
+        (2.0 * mde.tail_ns).max(min_effect),
+    );
 
-    if pooled_std < 1e-10 {
-        return 0.0;
+    let ci_gate_input = CiGateInput {
+        observed_diff: delta,
+        fixed_samples: first,
+        random_samples: second,
+        alpha: SANITY_ALPHA,
+        bootstrap_iterations: SANITY_BOOTSTRAP,
+        seed: Some(999),
+    };
+    let ci_gate = run_ci_gate(&ci_gate_input);
+
+    let bayes = compute_bayes_factor(&delta, &sigma0, prior_sigmas, 0.5);
+    if !ci_gate.passed {
+        bayes.posterior_probability.max(LEAK_THRESHOLD)
+    } else {
+        bayes.posterior_probability
     }
-
-    // Compute effect size (Cohen's d)
-    let effect_size = (mean1 - mean2).abs() / pooled_std;
-
-    // Convert to approximate "leak probability" using sigmoid
-    // Effect size > 0.2 starts indicating potential issues
-    let sigmoid = 1.0 / (1.0 + (-10.0 * (effect_size - 0.2)).exp());
-
-    sigmoid
 }
 
 #[cfg(test)]
@@ -151,11 +162,9 @@ mod tests {
 
     #[test]
     fn test_identical_samples_pass() {
-        // Identical samples should not trigger a warning
         let samples: Vec<f64> = (0..2000).map(|i| 100.0 + (i % 10) as f64).collect();
         let result = sanity_check(&samples);
 
-        // Should either be None or not be a BrokenHarness warning
         match result {
             None => {}
             Some(SanityWarning::InsufficientSamples { .. }) => {}

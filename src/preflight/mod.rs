@@ -17,7 +17,7 @@ mod sanity;
 mod system;
 
 pub use autocorr::{autocorrelation_check, AutocorrWarning};
-pub use generator::{generator_cost_check, GeneratorWarning};
+pub use generator::{generator_cost_check, measure_generator_cost, GeneratorWarning};
 pub use sanity::{sanity_check, SanityWarning};
 pub use system::{system_check, SystemWarning};
 

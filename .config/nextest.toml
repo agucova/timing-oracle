@@ -1,0 +1,13 @@
+[profile.default]
+failure-output = "immediate"
+status-level = "pass"
+final-status-level = "pass"
+retries = 0
+
+[profile.timing]
+test-threads = 1
+failure-output = "immediate"
+status-level = "fail"
+final-status-level = "fail"
+slow-timeout = { period = "120s", terminate-after = 3 }
+retries = 0

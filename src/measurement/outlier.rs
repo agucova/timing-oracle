@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_compute_percentile() {
-        let mut data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
         assert_eq!(compute_percentile(&mut data.clone(), 0.0), 1);
         // 50th percentile with linear interpolation is between 5 and 6

@@ -119,12 +119,18 @@ pub fn system_check() -> Vec<SystemWarning> {
         if let Some(warning) = check_cpu_governor_linux() {
             warnings.push(warning);
         }
-
-        // TODO: Additional Linux checks
-        // - Check turbo boost: /sys/devices/system/cpu/intel_pstate/no_turbo
-        // - Check hyperthreading: /sys/devices/system/cpu/smt/active
-        // - Check VM: /proc/cpuinfo for hypervisor flag
-        // - Check load: /proc/loadavg
+        if let Some(warning) = check_turbo_boost_linux() {
+            warnings.push(warning);
+        }
+        if let Some(warning) = check_hyperthreading_linux() {
+            warnings.push(warning);
+        }
+        if let Some(warning) = check_vm_detection_linux() {
+            warnings.push(warning);
+        }
+        if let Some(warning) = check_load_linux() {
+            warnings.push(warning);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -183,21 +189,64 @@ fn check_windows_power_settings() -> Option<SystemWarning> {
     None
 }
 
-/// Check if running in a virtual machine.
-///
-/// TODO: Implement VM detection for various platforms.
-#[allow(dead_code)]
-fn check_vm_detection() -> Option<SystemWarning> {
-    // TODO: Implement VM detection
-    // Linux: Check /proc/cpuinfo for hypervisor flag
-    // macOS: Check sysctl kern.hv_support
-    // Windows: Check WMI or registry
+#[cfg(target_os = "linux")]
+fn check_turbo_boost_linux() -> Option<SystemWarning> {
+    let intel_path = "/sys/devices/system/cpu/intel_pstate/no_turbo";
+    if let Ok(value) = std::fs::read_to_string(intel_path) {
+        if value.trim() == "0" {
+            return Some(SystemWarning::TurboBoostEnabled);
+        }
+        return None;
+    }
+
+    let generic_path = "/sys/devices/system/cpu/cpufreq/boost";
+    if let Ok(value) = std::fs::read_to_string(generic_path) {
+        if value.trim() == "1" {
+            return Some(SystemWarning::TurboBoostEnabled);
+        }
+    }
+
     None
 }
 
-/// Check system load average.
-///
-/// TODO: Implement load average check.
+#[cfg(target_os = "linux")]
+fn check_hyperthreading_linux() -> Option<SystemWarning> {
+    let path = "/sys/devices/system/cpu/smt/active";
+    if let Ok(value) = std::fs::read_to_string(path) {
+        if value.trim() == "1" {
+            return Some(SystemWarning::HyperthreadingEnabled);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn check_vm_detection_linux() -> Option<SystemWarning> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    if cpuinfo.to_lowercase().contains("hypervisor") {
+        return Some(SystemWarning::VirtualMachineDetected { vm_type: None });
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn check_load_linux() -> Option<SystemWarning> {
+    let loadavg = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let load = loadavg
+        .split_whitespace()
+        .next()
+        .and_then(|val| val.parse::<f64>().ok())?;
+
+    let threshold = 1.0;
+    if load > threshold {
+        Some(SystemWarning::HighSystemLoad {
+            load_average: load,
+            threshold,
+        })
+    } else {
+        None
+    }
+}
 #[allow(dead_code)]
 fn check_system_load() -> Option<SystemWarning> {
     const LOAD_THRESHOLD: f64 = 1.0;

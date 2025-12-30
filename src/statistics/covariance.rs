@@ -40,16 +40,15 @@ impl CovarianceEstimate {
     }
 }
 
-/// Estimate covariance matrix of quantile vectors via block bootstrap.
+/// Estimate covariance matrix of single-class quantile vectors via block bootstrap.
 ///
-/// This function bootstraps single-class quantile vectors (not differences)
+/// This function bootstraps quantile vectors for one class (not differences)
 /// and computes their sample covariance. Jitter is added to the diagonal
 /// for numerical stability.
 ///
 /// # Arguments
 ///
-/// * `fixed_data` - Timing measurements for fixed input class
-/// * `random_data` - Timing measurements for random input class
+/// * `data` - Timing measurements for a single input class
 /// * `n_bootstrap` - Number of bootstrap replicates (typically 1000-5000)
 /// * `seed` - Random seed for reproducibility
 ///
@@ -61,42 +60,37 @@ impl CovarianceEstimate {
 ///
 /// 1. Compute block size as sqrt(n)
 /// 2. For each bootstrap replicate:
-///    a. Resample fixed measurements with block bootstrap
-///    b. Resample random measurements with block bootstrap
-///    c. Compute deciles for each resampled class
-///    d. Compute difference vector: q_fixed - q_random
-/// 3. Compute sample covariance of difference vectors
+///    a. Resample measurements with block bootstrap
+///    b. Compute deciles for the resampled data
+/// 3. Compute sample covariance of quantile vectors
 /// 4. Add jitter to diagonal for numerical stability
 pub fn bootstrap_covariance_matrix(
-    fixed_data: &[f64],
-    random_data: &[f64],
+    data: &[f64],
     n_bootstrap: usize,
     seed: u64,
 ) -> CovarianceEstimate {
-    let n = fixed_data.len().min(random_data.len());
+    let n = data.len();
     let block_size = compute_block_size(n);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-    // Storage for bootstrap quantile difference vectors
-    let mut bootstrap_diffs: Vec<Vector9> = Vec::with_capacity(n_bootstrap);
+    // Storage for bootstrap quantile vectors
+    let mut bootstrap_vectors: Vec<Vector9> = Vec::with_capacity(n_bootstrap);
 
     // Generate bootstrap replicates
     for _ in 0..n_bootstrap {
-        // Resample each class independently
-        let resampled_fixed = block_bootstrap_resample(fixed_data, block_size, &mut rng);
-        let resampled_random = block_bootstrap_resample(random_data, block_size, &mut rng);
+        // Resample data
+        let resampled = block_bootstrap_resample(data, block_size, &mut rng);
 
         // Compute deciles for resampled data
-        let q_fixed = compute_deciles(&resampled_fixed);
-        let q_random = compute_deciles(&resampled_random);
+        let q = compute_deciles(&resampled);
 
-        // Store the difference
-        bootstrap_diffs.push(q_fixed - q_random);
+        // Store the quantile vector
+        bootstrap_vectors.push(q);
     }
 
     // Compute sample covariance matrix
-    let cov_matrix = compute_sample_covariance(&bootstrap_diffs);
+    let cov_matrix = compute_sample_covariance(&bootstrap_vectors);
 
     // Add jitter for numerical stability
     let (stabilized_matrix, jitter) = add_diagonal_jitter(cov_matrix);
@@ -197,10 +191,9 @@ mod tests {
     #[test]
     fn test_covariance_estimate_basic() {
         // Generate simple test data
-        let fixed: Vec<f64> = (0..1000).map(|x| (x as f64) + 100.0).collect();
-        let random: Vec<f64> = (0..1000).map(|x| x as f64).collect();
+        let data: Vec<f64> = (0..1000).map(|x| (x as f64) + 100.0).collect();
 
-        let estimate = bootstrap_covariance_matrix(&fixed, &random, 100, 42);
+        let estimate = bootstrap_covariance_matrix(&data, 100, 42);
 
         assert_eq!(estimate.n_bootstrap, 100);
         assert!(estimate.block_size > 0);
@@ -209,10 +202,9 @@ mod tests {
 
     #[test]
     fn test_covariance_symmetry() {
-        let fixed: Vec<f64> = (0..500).map(|x| (x as f64) * 0.1).collect();
-        let random: Vec<f64> = (0..500).map(|x| (x as f64) * 0.1 + 10.0).collect();
+        let data: Vec<f64> = (0..500).map(|x| (x as f64) * 0.1).collect();
 
-        let estimate = bootstrap_covariance_matrix(&fixed, &random, 50, 123);
+        let estimate = bootstrap_covariance_matrix(&data, 50, 123);
 
         // Check symmetry
         for i in 0..9 {

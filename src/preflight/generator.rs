@@ -153,29 +153,20 @@ pub fn generator_cost_check(fixed_gen_time_ns: f64, random_gen_time_ns: f64) -> 
 ///
 /// Average time per generation in nanoseconds.
 #[allow(dead_code)]
-pub fn measure_generator_cost<F, T>(generator: F, iterations: usize) -> f64
+pub fn measure_generator_cost<F, T>(mut generator: F, iterations: usize) -> f64
 where
-    F: Fn() -> T,
+    F: FnMut() -> T,
 {
     if iterations == 0 {
         return 0.0;
     }
 
-    // TODO: Use high-precision timer to measure generator cost.
-    // For now, return a placeholder.
-    //
-    // Implementation would look something like:
-    // ```
-    // let start = std::time::Instant::now();
-    // for _ in 0..iterations {
-    //     std::hint::black_box(generator());
-    // }
-    // let elapsed = start.elapsed();
-    // elapsed.as_nanos() as f64 / iterations as f64
-    // ```
-
-    let _ = generator; // Suppress unused warning
-    0.0 // Placeholder
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(generator());
+    }
+    let elapsed = start.elapsed();
+    elapsed.as_nanos() as f64 / iterations as f64
 }
 
 #[cfg(test)]
