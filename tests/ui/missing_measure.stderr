@@ -1,0 +1,21 @@
+error: missing required field `measure`
+
+       The `measure` field is a closure that takes the input and performs
+       the operation to be timed.
+
+       Example:
+       timing_test! {
+       baseline: || [0u8; 32],
+       sample: || rand::random::<[u8; 32]>(),
+       measure: |input| { encrypt(&input); },  // <-- Add this
+       }
+ --> tests/ui/missing_measure.rs:5:19
+  |
+5 |       let _result = timing_test! {
+  |  ___________________^
+6 | |         baseline: || 42u8,
+7 | |         sample: || rand::random::<u8>(),
+8 | |     };
+  | |_____^
+  |
+  = note: this error originates in the macro `timing_test` (in Nightly builds, run with -Z macro-backtrace for more info)

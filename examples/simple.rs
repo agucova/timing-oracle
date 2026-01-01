@@ -2,10 +2,10 @@
 //!
 //! This demonstrates the CORRECT way to test operations:
 //! - Pre-generate all inputs before measurement
-//! - Both closures execute identical code paths
+//! - The test closure executes identical code for fixed and random inputs
 //! - Only the input data differs
 
-use timing_oracle::{test, helpers::InputPair, TimingOracle};
+use timing_oracle::{helpers::InputPair, timing_test_checked, Outcome, TimingOracle};
 
 fn main() {
     println!("timing-oracle simple example\n");
@@ -13,10 +13,9 @@ fn main() {
     // Example: Testing a potentially leaky comparison
     let secret = [0u8; 32];
 
-    // ✅ CORRECT: Pre-generate inputs outside closures
-    // Both fixed and random generators are called BEFORE measurement
+    // Pre-generate inputs using InputPair
     let inputs = InputPair::new(
-        [0u8; 32],  // Fixed: all zeros (same as secret)
+        || [0u8; 32], // Baseline: all zeros (same as secret)
         || {
             let mut arr = [0u8; 32];
             for i in 0..32 {
@@ -27,35 +26,59 @@ fn main() {
     );
 
     // Simple API with default config
-    let result = test(
-        || compare_bytes(&secret, inputs.fixed()),
-        || compare_bytes(&secret, inputs.random()),
-    );
+    let outcome = TimingOracle::new().test(inputs, |data| {
+        compare_bytes(&secret, data);
+    });
+
+    let result = match outcome {
+        Outcome::Completed(r) => r,
+        Outcome::Unmeasurable {
+            recommendation, ..
+        } => {
+            println!("Could not measure: {}", recommendation);
+            return;
+        }
+    };
 
     println!("Leak probability: {:.1}%", result.leak_probability * 100.0);
     println!("CI gate passed: {}", result.ci_gate.passed);
     println!("Quality: {:?}", result.quality);
-    println!("Timer: {} ({:.1}ns resolution)", result.metadata.timer, result.metadata.timer_resolution_ns);
-    println!("Batching: enabled={}, K={}, ticks_per_batch={:.1}",
+    println!(
+        "Timer: {} ({:.1}ns resolution)",
+        result.metadata.timer, result.metadata.timer_resolution_ns
+    );
+    println!(
+        "Batching: enabled={}, K={}, ticks_per_batch={:.1}",
         result.metadata.batching.enabled,
         result.metadata.batching.k,
-        result.metadata.batching.ticks_per_batch);
+        result.metadata.batching.ticks_per_batch
+    );
     println!("Rationale: {}", result.metadata.batching.rationale);
-    println!("MDE shift: {:.2}ns, tail: {:.2}ns",
-        result.min_detectable_effect.shift_ns,
-        result.min_detectable_effect.tail_ns);
+    println!(
+        "MDE shift: {:.2}ns, tail: {:.2}ns",
+        result.min_detectable_effect.shift_ns, result.min_detectable_effect.tail_ns
+    );
 
-    // Builder API with custom config
-    let result = TimingOracle::new()
-        .samples(10_000) // Fewer samples for quick demo
-        .ci_alpha(0.01)
-        .test(
-            || compare_bytes(&secret, inputs.fixed()),
-            || compare_bytes(&secret, inputs.random()),
-        );
+    // Using timing_test_checked! macro with custom config
+    let outcome = timing_test_checked! {
+        oracle: TimingOracle::new().samples(10_000).ci_alpha(0.01),
+        baseline: || [0u8; 32],
+        sample: || {
+            let mut arr = [0u8; 32];
+            for i in 0..32 {
+                arr[i] = rand::random();
+            }
+            arr
+        },
+        measure: |data| {
+            compare_bytes(&secret, data);
+        },
+    };
 
-    println!("\nWith custom config:");
-    println!("Leak probability: {:.1}%", result.leak_probability * 100.0);
+    if let Outcome::Completed(result) = outcome {
+        println!("\nWith custom config:");
+        println!("Leak probability: {:.1}%", result.leak_probability * 100.0);
+    }
 }
 
 /// Non-constant-time comparison (intentionally leaky for demo).

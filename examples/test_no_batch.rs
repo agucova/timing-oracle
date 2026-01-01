@@ -4,17 +4,15 @@ use timing_oracle::TimingOracle;
 
 fn main() {
     let secret = [0xABu8; 32];
-    // Use same sample count as the failing tests
-    const SAMPLES: usize = 100_000;
-    let inputs = InputPair::with_samples(SAMPLES, [0xABu8; 32], rand_bytes);
+    let inputs = InputPair::new(|| [0xABu8; 32], rand_bytes);
 
     // Test with adaptive batching
     let result = TimingOracle::new()
-        .samples(SAMPLES)
-        .test(
-            || constant_time_compare(&secret, inputs.fixed()),
-            || constant_time_compare(&secret, inputs.random()),
-        );
+        .samples(100_000)
+        .test(inputs, |input| {
+            std::hint::black_box(constant_time_compare(&secret, input));
+        })
+        .unwrap_completed();
 
     println!("=== Adaptive batching ===");
     println!("Leak probability: {:.4}", result.leak_probability);

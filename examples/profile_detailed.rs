@@ -29,7 +29,7 @@ fn main() {
     let config = TimingOracle::balanced().config().clone();
     let timer = Timer::new();
     let collector = Collector::with_timer(timer.clone(), config.warmup);
-    let inputs = InputPair::with_samples(config.samples, [0u8; 512], rand_bytes_512);
+    let inputs = InputPair::new(|| [0u8; 512], rand_bytes_512);
 
     println!("Config: {} samples per class", config.samples);
     println!("        {} CI bootstrap iterations", config.ci_bootstrap_iterations);
@@ -40,8 +40,8 @@ fn main() {
     let start = Instant::now();
     let (fixed_cycles, random_cycles, batching) = collector.collect_separated(
         config.samples,
-        || early_exit_compare(&secret, inputs.fixed()),
-        || early_exit_compare(&secret, inputs.random()),
+        || early_exit_compare(&secret, &inputs.baseline()),
+        || early_exit_compare(&secret, &inputs.sample()),
     );
     let stage1_time = start.elapsed();
     println!("  Time: {:.3}s ({:.1}%)", stage1_time.as_secs_f64(), 100.0);

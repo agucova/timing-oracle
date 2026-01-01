@@ -1,7 +1,6 @@
 //! Tests that must detect known timing leaks.
 
-use timing_oracle::helpers::InputPair;
-use timing_oracle::TimingOracle;
+use timing_oracle::{skip_if_unreliable, timing_test_checked, TimingOracle};
 
 /// Test that early-exit comparison is detected as leaky.
 ///
@@ -11,31 +10,17 @@ use timing_oracle::TimingOracle;
 fn detects_early_exit_comparison() {
     let secret = [0u8; 512];
 
-    // Pre-generate inputs using InputPair
-    // Use larger arrays to ensure measurable timing differences
-    const SAMPLES: usize = 100_000;
-    let inputs = InputPair::with_samples(SAMPLES, [0u8; 512], rand_bytes_512);
+    // Use the timing_test_checked! macro for explicit Outcome handling
+    let outcome = timing_test_checked! {
+        oracle: TimingOracle::new().samples(100_000),
+        baseline: || [0u8; 512],
+        sample: || rand_bytes_512(),
+        measure: |data| {
+            early_exit_compare(&secret, data);
+        },
+    };
 
-    let result = TimingOracle::new()
-        .samples(SAMPLES)
-        .test(
-            || early_exit_compare(&secret, inputs.fixed()),
-            || early_exit_compare(&secret, inputs.random()),
-        );
-
-    // If operation is unmeasurable, skip the assertion
-    // (This happens with very coarse timers where even 512 bytes is too fast)
-    if result.metadata.batching.unmeasurable.is_some() {
-        eprintln!(
-            "Warning: Operation unmeasurable ({:.1}ns < {:.1}ns threshold). \
-             Consider using a finer-resolution timer.",
-            result.metadata.batching.unmeasurable.as_ref().unwrap().operation_ns,
-            result.metadata.batching.unmeasurable.as_ref().unwrap().threshold_ns
-        );
-        // Still check that we don't false-positive claim "safe"
-        // When unmeasurable, we should not pass the CI gate with high confidence
-        return;
-    }
+    let result = skip_if_unreliable!(outcome, "detects_early_exit_comparison");
 
     assert!(
         result.leak_probability > 0.9,
@@ -51,24 +36,24 @@ fn detects_early_exit_comparison() {
 /// Test that branch-based timing is detected.
 #[test]
 fn detects_branch_timing() {
-    // Pre-generate inputs using InputPair
-    const SAMPLES: usize = 100_000;
-    let inputs = InputPair::from_fn_with_samples(
-        SAMPLES,
-        || 0u8,
-        || rand::random::<u8>() | 1, // Never zero
-    );
+    // Use the timing_test_checked! macro
+    // Fixed: 0 (triggers expensive branch)
+    // Random: never zero (skips expensive branch)
+    let outcome = timing_test_checked! {
+        oracle: TimingOracle::new().samples(100_000),
+        baseline: || 0u8,
+        sample: || rand::random::<u8>() | 1,
+        measure: |x| {
+            branch_on_zero(*x);
+        },
+    };
 
-    let result = TimingOracle::new()
-        .samples(SAMPLES)
-        .test(
-            || branch_on_zero(*inputs.fixed()),
-            || branch_on_zero(*inputs.random()),
-        );
+    let result = skip_if_unreliable!(outcome, "detects_branch_timing");
 
     assert!(
         result.leak_probability > 0.9,
-        "Should detect branch timing leak"
+        "Should detect branch timing leak, got {}",
+        result.leak_probability
     );
 }
 

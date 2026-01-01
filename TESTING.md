@@ -293,20 +293,6 @@ cargo test -- --test-threads=1
 
 ## Test Configuration
 
-### Timer Reuse Optimization
-
-The calibration tests use `Timer::new()` once and reuse it across trials to avoid ~50ms calibration overhead per test:
-
-```rust
-let timer = Timer::new();  // Calibrate once
-
-for _ in 0..100 {
-    let result = TimingOracle::quick()
-        .with_timer(timer.clone())  // Reuse
-        .test(|| noise(), || noise());
-}
-```
-
 ### Quick Mode
 
 Integration tests use `TimingOracle::new()` with 100k samples for thorough validation. During development, use `TimingOracle::quick()` (5k samples) for faster iteration.

@@ -1,0 +1,8 @@
+error: `measure` must be a closure that takes the input.
+
+       Example:
+       measure: |input| { my_function(&input); }
+  --> tests/ui/measure_not_closure.rs:12:18
+   |
+12 |         measure: my_test,  // Should be |input| my_test(input)
+   |                  ^^^^^^^

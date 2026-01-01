@@ -279,8 +279,8 @@ impl Collector {
             // Single-iteration measurement
             for class in schedule {
                 let cycles = match class {
-                    Class::Fixed => self.timer.measure_cycles(&mut fixed),
-                    Class::Random => self.timer.measure_cycles(&mut random),
+                    Class::Baseline => self.timer.measure_cycles(&mut fixed),
+                    Class::Sample => self.timer.measure_cycles(&mut random),
                 };
                 samples.push(Sample::new(class, cycles));
             }
@@ -288,8 +288,8 @@ impl Collector {
             // Batched measurement - return batch totals (not divided)
             for class in schedule {
                 let cycles = match class {
-                    Class::Fixed => self.measure_batch_total(&mut fixed, k),
-                    Class::Random => self.measure_batch_total(&mut random, k),
+                    Class::Baseline => self.measure_batch_total(&mut fixed, k),
+                    Class::Sample => self.measure_batch_total(&mut random, k),
                 };
                 samples.push(Sample::new(class, cycles));
             }
@@ -338,8 +338,8 @@ impl Collector {
 
         // Create balanced schedule
         let mut schedule: Vec<Class> = Vec::with_capacity(samples_per_class * 2);
-        schedule.extend(std::iter::repeat(Class::Fixed).take(samples_per_class));
-        schedule.extend(std::iter::repeat(Class::Random).take(samples_per_class));
+        schedule.extend(std::iter::repeat(Class::Baseline).take(samples_per_class));
+        schedule.extend(std::iter::repeat(Class::Sample).take(samples_per_class));
 
         // Shuffle for randomized interleaving
         schedule.shuffle(&mut rng);
@@ -369,8 +369,8 @@ impl Collector {
 
         for sample in samples {
             match sample.class {
-                Class::Fixed => fixed_samples.push(sample.cycles),
-                Class::Random => random_samples.push(sample.cycles),
+                Class::Baseline => fixed_samples.push(sample.cycles),
+                Class::Sample => random_samples.push(sample.cycles),
             }
         }
 
@@ -390,8 +390,8 @@ mod tests {
 
     #[test]
     fn test_sample_creation() {
-        let sample = Sample::new(Class::Fixed, 1000);
-        assert_eq!(sample.class, Class::Fixed);
+        let sample = Sample::new(Class::Baseline, 1000);
+        assert_eq!(sample.class, Class::Baseline);
         assert_eq!(sample.cycles, 1000);
     }
 
@@ -400,11 +400,11 @@ mod tests {
         let collector = Collector::new(0);
         let schedule = collector.create_schedule(100);
 
-        let fixed_count = schedule.iter().filter(|c| **c == Class::Fixed).count();
-        let random_count = schedule.iter().filter(|c| **c == Class::Random).count();
+        let baseline_count = schedule.iter().filter(|c| **c == Class::Baseline).count();
+        let sample_count = schedule.iter().filter(|c| **c == Class::Sample).count();
 
-        assert_eq!(fixed_count, 100);
-        assert_eq!(random_count, 100);
+        assert_eq!(baseline_count, 100);
+        assert_eq!(sample_count, 100);
     }
 
     #[test]

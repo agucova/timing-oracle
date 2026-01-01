@@ -35,11 +35,14 @@ pub fn counter_rng_seed(base_seed: u64, counter: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Compute the optimal block size for block bootstrap.
+/// Compute the optimal block size for block bootstrap using n^(1/3) scaling.
 ///
-/// Uses approximately sqrt(n) as the block size, which is a common
-/// heuristic that balances between capturing autocorrelation structure
-/// and having enough blocks for resampling variability.
+/// The block length follows Politis & Romano (1994) and Kunsch (1989):
+/// l(n) = O(n^(1/3)) balances bias-variance tradeoff for stationary data.
+///
+/// The constant 1.3 is an engineering default that works well empirically.
+/// At n=30k, this gives ~40 blocks (vs ~173 with sqrt(n)), preserving
+/// autocorrelation structure better.
 ///
 /// # Arguments
 ///
@@ -49,7 +52,7 @@ pub fn counter_rng_seed(base_seed: u64, counter: u64) -> u64 {
 ///
 /// The recommended block size, minimum 1.
 pub fn compute_block_size(n: usize) -> usize {
-    let block_size = (n as f64).sqrt().round() as usize;
+    let block_size = (1.3 * (n as f64).powf(1.0 / 3.0)).ceil() as usize;
     block_size.max(1)
 }
 
@@ -207,6 +210,129 @@ pub fn stratified_block_bootstrap<R: Rng>(
     (resampled_fixed, resampled_random)
 }
 
+use crate::types::TimingSample;
+
+/// Perform joint block bootstrap resampling on interleaved measurements.
+///
+/// This preserves temporal pairing between fixed and random samples, which
+/// captures the cross-covariance Cov(q_F, q_R) > 0 from common-mode noise.
+/// Joint resampling gives the correct (smaller) Var(Δ), improving statistical
+/// power compared to independent resampling.
+///
+/// # Arguments
+///
+/// * `interleaved` - Samples in measurement order, each tagged with its class
+/// * `block_size` - Size of contiguous blocks to resample
+/// * `rng` - Random number generator
+///
+/// # Returns
+///
+/// A new vector of resampled `TimingSample`s with the same length as input.
+///
+/// # Algorithm
+///
+/// 1. Sample blocks of consecutive measurements (preserving F/R pairing)
+/// 2. The class labels travel with their timing values
+/// 3. After resampling, caller splits by class and computes quantile difference
+#[allow(dead_code)]
+pub fn block_bootstrap_resample_joint<R: Rng>(
+    interleaved: &[TimingSample],
+    block_size: usize,
+    rng: &mut R,
+) -> Vec<TimingSample> {
+    if interleaved.is_empty() {
+        return Vec::new();
+    }
+
+    let n = interleaved.len();
+    let block_size = block_size.max(1).min(n);
+
+    // Number of possible starting positions for blocks
+    let num_block_starts = n.saturating_sub(block_size) + 1;
+    if num_block_starts == 0 {
+        return interleaved.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(n);
+
+    // Sample blocks until we have enough data
+    while result.len() < n {
+        // Random starting position for this block
+        let start = rng.random_range(0..num_block_starts);
+        let end = (start + block_size).min(n);
+
+        // Add the entire block (preserving class labels)
+        for sample in interleaved.iter().take(end).skip(start) {
+            if result.len() >= n {
+                break;
+            }
+            result.push(*sample);
+        }
+    }
+
+    result
+}
+
+/// Perform joint block bootstrap resampling into an existing buffer.
+///
+/// This is an optimized version that writes into a preallocated buffer.
+/// Used in parallel bootstrap for better performance.
+///
+/// # Arguments
+///
+/// * `interleaved` - Samples in measurement order, each tagged with its class
+/// * `block_size` - Size of contiguous blocks to resample
+/// * `rng` - Random number generator
+/// * `out` - Output buffer (must have same length as `interleaved`)
+///
+/// # Panics
+///
+/// Panics if `out.len() != interleaved.len()`.
+pub fn block_bootstrap_resample_joint_into<R: Rng>(
+    interleaved: &[TimingSample],
+    block_size: usize,
+    rng: &mut R,
+    out: &mut [TimingSample],
+) {
+    assert_eq!(
+        out.len(),
+        interleaved.len(),
+        "Output buffer must have same length as input data"
+    );
+
+    if interleaved.is_empty() {
+        return;
+    }
+
+    let n = interleaved.len();
+    let block_size = block_size.max(1).min(n);
+
+    // Number of possible starting positions for blocks
+    let num_block_starts = n.saturating_sub(block_size) + 1;
+    if num_block_starts == 0 {
+        out.copy_from_slice(interleaved);
+        return;
+    }
+
+    let mut pos = 0;
+
+    // Sample blocks until we fill the output buffer
+    while pos < n {
+        // Random starting position for this block
+        let start = rng.random_range(0..num_block_starts);
+        let block_end = (start + block_size).min(n);
+        let block_len = block_end - start;
+
+        // How much can we copy without overflowing output?
+        let copy_len = block_len.min(n - pos);
+
+        // Copy the block (preserving class labels)
+        out[pos..pos + copy_len].copy_from_slice(&interleaved[start..start + copy_len]);
+
+        pos += copy_len;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,9 +340,14 @@ mod tests {
 
     #[test]
     fn test_block_size_computation() {
-        assert_eq!(compute_block_size(100), 10);
-        assert_eq!(compute_block_size(10000), 100);
-        assert_eq!(compute_block_size(1), 1);
+        // Formula: ceil(1.3 * n^(1/3))
+        // n=100:   1.3 * 100^(1/3) = 1.3 * 4.6416 = 6.03 -> ceil = 7
+        // n=10000: 1.3 * 10000^(1/3) = 1.3 * 21.544 = 28.007 -> ceil = 29
+        // n=30000: 1.3 * 30000^(1/3) = 1.3 * 31.072 = 40.39 -> ceil = 41
+        assert_eq!(compute_block_size(100), 7);
+        assert_eq!(compute_block_size(10000), 29);
+        assert_eq!(compute_block_size(30000), 41);
+        assert_eq!(compute_block_size(1), 2); // 1.3 * 1^(1/3) = 1.3 -> ceil = 2
         assert_eq!(compute_block_size(0), 1); // Minimum is 1
     }
 

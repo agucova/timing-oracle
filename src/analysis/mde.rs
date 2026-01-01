@@ -1,22 +1,24 @@
-//! Minimum Detectable Effect (MDE) estimation.
+//! Minimum Detectable Effect (MDE) estimation (spec §2.7).
 //!
-//! This module estimates the smallest timing effect that can be reliably
-//! detected given the current noise level. This helps users understand:
+//! The MDE answers: "given the noise level in this measurement, what's the
+//! smallest effect I could reliably detect?"
 //!
-//! - Whether "no leak detected" means the code is safe, or just noisy
-//! - What magnitude of timing difference they could detect
-//! - Whether more samples are needed for better sensitivity
+//! This is critical for interpreting negative results. If MDE is 50ns and you're
+//! concerned about 10ns effects, a passing test doesn't mean the code is safe—
+//! it means the measurement wasn't sensitive enough.
 //!
-//! The MDE is computed by:
-//! 1. Sampling from the null distribution (no timing leak)
-//! 2. Fitting the effect model to each null sample
-//! 3. Taking the 95th percentile of |beta_hat| as the MDE
+//! Formula (spec §2.7) with 80% power:
+//! ```text
+//! MDE_μ = (z_{1-α/2} + z_{0.8}) × sqrt((1ᵀ Σ₀⁻¹ 1)⁻¹)
+//! MDE_τ = (z_{1-α/2} + z_{0.8}) × sqrt((bᵀ Σ₀⁻¹ b)⁻¹)
+//! ```
+//! where z_{0.8} ≈ 0.842 is the 80th percentile of the standard normal.
 
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::constants::{B_TAIL, ONES};
 use crate::result::MinDetectableEffect;
-use crate::types::{Matrix2, Matrix9, Matrix9x2, Vector2, Vector9};
+use crate::types::{Matrix9, Vector9};
 
 use super::effect::decompose_effect;
 
@@ -40,42 +42,84 @@ impl From<MdeEstimate> for MinDetectableEffect {
     }
 }
 
-/// Compute MDE analytically using GLS formula.
+/// Compute MDE analytically using single-effect projection formulas (spec §2.7).
 ///
-/// This is statistically equivalent to the Monte Carlo approach but 1000× faster.
-/// Uses Cholesky solve for Σ₀⁻¹ X and closed-form 2×2 inverse for numerical stability.
-///
-/// For Gaussian distribution, the 95th percentile of |β̂| equals the two-sided 95% CI
-/// half-width: P(|β̂| > z * SE) = 0.05 ⟺ 95th percentile ≈ 1.96 × SE,
-/// where SE comes from GLS variance: Var(β̂) = (Xᵀ Σ₀⁻¹ X)⁻¹ = V.
+/// Formula:
+/// ```text
+/// MDE_μ = z_{1-α/2} × sqrt((1ᵀ Σ₀⁻¹ 1)⁻¹)
+/// MDE_τ = z_{1-α/2} × sqrt((bᵀ Σ₀⁻¹ b)⁻¹)
+/// ```
 ///
 /// # Arguments
 ///
-/// * `covariance` - Pooled covariance matrix of quantile differences
+/// * `covariance` - Pooled covariance matrix of quantile differences (Σ₀)
+/// * `alpha` - Significance level (e.g., 0.05 for 95% confidence)
 ///
 /// # Returns
 ///
 /// A tuple `(mde_shift, mde_tail)` with minimum detectable effects in nanoseconds.
-pub fn analytical_mde(covariance: &Matrix9) -> (f64, f64) {
-    // 1. Build design matrix X = [ONES | B_TAIL]
-    let x = build_design_matrix();
-
-    // 2. Compute Σ₀⁻¹ X via Cholesky solve (numerically stable)
+pub fn analytical_mde(covariance: &Matrix9, alpha: f64) -> (f64, f64) {
+    // Use Cholesky decomposition for numerically stable solve of Σ₀⁻¹ v
     let chol = safe_cholesky(covariance);
-    let sigma_inv_x = chol.solve(&x);
 
-    // 3. Compute V⁻¹ = Xᵀ Σ₀⁻¹ X (only 2×2!)
-    let v_inv = x.transpose() * sigma_inv_x;
+    // For shift MDE: Var(μ̂) = (1ᵀ Σ₀⁻¹ 1)⁻¹
+    let ones_vec = Vector9::from_iterator(ONES.iter().cloned());
+    let sigma_inv_ones = chol.solve(&ones_vec);
+    let precision_shift = ones_vec.dot(&sigma_inv_ones);
+    let var_shift = if precision_shift.abs() > 1e-12 {
+        1.0 / precision_shift
+    } else {
+        // Near-singular: return huge MDE (conservative fallback)
+        1e12
+    };
 
-    // 4. Invert 2×2 matrix using closed form
-    let v = safe_inverse_2x2(&v_inv);
+    // For tail MDE: Var(τ̂) = (bᵀ Σ₀⁻¹ b)⁻¹
+    let b_tail_vec = Vector9::from_iterator(B_TAIL.iter().cloned());
+    let sigma_inv_b = chol.solve(&b_tail_vec);
+    let precision_tail = b_tail_vec.dot(&sigma_inv_b);
+    let var_tail = if precision_tail.abs() > 1e-12 {
+        1.0 / precision_tail
+    } else {
+        1e12
+    };
 
-    // 5. Extract standard errors and compute MDEs
-    let z = 1.96; // Two-sided 95% CI
-    let mde_shift = z * v[(0, 0)].sqrt();
-    let mde_tail = z * v[(1, 1)].sqrt();
+    // MDE with 80% power: (z_{1-α/2} + z_{0.8}) × SE (spec §2.7)
+    let z_alpha = probit(1.0 - alpha / 2.0);
+    let z_power = probit(0.8); // z_{0.8} ≈ 0.842 for 80% power
+    let z = z_alpha + z_power;
+    let mde_shift = z * var_shift.sqrt();
+    let mde_tail = z * var_tail.sqrt();
 
     (mde_shift, mde_tail)
+}
+
+/// Inverse normal CDF (probit function).
+///
+/// Computes Φ⁻¹(p) using the Abramowitz & Stegun approximation (26.2.23).
+/// Accurate to ~4.5×10⁻⁴ for p ∈ (0, 1).
+fn probit(p: f64) -> f64 {
+    if p <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+
+    // Use symmetry: for p < 0.5, compute -probit(1-p)
+    let (sign, q) = if p < 0.5 { (-1.0, 1.0 - p) } else { (1.0, p) };
+
+    // Rational approximation constants (Abramowitz & Stegun 26.2.23)
+    const C0: f64 = 2.515517;
+    const C1: f64 = 0.802853;
+    const C2: f64 = 0.010328;
+    const D1: f64 = 1.432788;
+    const D2: f64 = 0.189269;
+    const D3: f64 = 0.001308;
+
+    let t = (-2.0 * (1.0 - q).ln()).sqrt();
+    let z = t - (C0 + C1 * t + C2 * t * t) / (1.0 + D1 * t + D2 * t * t + D3 * t * t * t);
+
+    sign * z
 }
 
 /// Monte Carlo MDE estimation (kept for benchmarking).
@@ -129,25 +173,18 @@ pub fn estimate_mde_monte_carlo(
     }
 }
 
-/// Estimate the minimum detectable effect.
-///
-/// Now uses analytical formula (1000× faster than Monte Carlo).
+/// Estimate the minimum detectable effect (spec §2.7).
 ///
 /// # Arguments
 ///
-/// * `covariance` - Pooled covariance matrix of quantile differences
-/// * `n_simulations` - **Ignored** (backward compatibility only)
-/// * `prior_sigmas` - **Ignored** (backward compatibility only)
+/// * `covariance` - Pooled covariance matrix of quantile differences (Σ₀)
+/// * `alpha` - Significance level (e.g., 0.01 for 99% confidence)
 ///
 /// # Returns
 ///
 /// An `MdeEstimate` with shift and tail MDE in nanoseconds.
-pub fn estimate_mde(
-    covariance: &Matrix9,
-    _n_simulations: usize,    // Ignored (backward compat)
-    _prior_sigmas: (f64, f64), // Ignored (backward compat)
-) -> MdeEstimate {
-    let (shift_ns, tail_ns) = analytical_mde(covariance);
+pub fn estimate_mde(covariance: &Matrix9, alpha: f64) -> MdeEstimate {
+    let (shift_ns, tail_ns) = analytical_mde(covariance, alpha);
 
     MdeEstimate {
         shift_ns,
@@ -170,18 +207,6 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
     let idx = idx.min(values.len() - 1);
 
     values[idx]
-}
-
-/// Build the 9x2 design matrix [ones | b_tail] for effect decomposition.
-fn build_design_matrix() -> Matrix9x2 {
-    let mut x = Matrix9x2::zeros();
-
-    for i in 0..9 {
-        x[(i, 0)] = ONES[i];
-        x[(i, 1)] = B_TAIL[i];
-    }
-
-    x
 }
 
 /// Safe Cholesky decomposition with adaptive jitter for near-singular matrices.
@@ -208,42 +233,6 @@ fn safe_cholesky(matrix: &Matrix9) -> nalgebra::Cholesky<f64, nalgebra::Const<9>
         .expect("Cholesky failed even after regularization")
 }
 
-/// Safe 2×2 matrix inverse using closed-form formula.
-///
-/// Returns conservative huge MDEs (1e12) if the matrix is truly singular,
-/// which causes priors to be dominated by min_effect_of_concern_ns.
-fn safe_inverse_2x2(m: &Matrix2) -> Matrix2 {
-    let a = m[(0, 0)];
-    let b = m[(0, 1)];
-    let c = m[(1, 0)];
-    let d = m[(1, 1)];
-
-    let det = a * d - b * c;
-
-    // Warn on near-singular (but not failing) cases
-    if det.abs() < 1e-8 {
-        eprintln!(
-            "Warning: Near-singular GLS precision matrix (det={:.2e}), MDE estimates may be unstable",
-            det
-        );
-    }
-
-    // Check for truly singular matrix
-    if det.abs() < 1e-12 {
-        // Design matrix unidentifiable given this covariance structure
-        // Return conservative (huge) MDEs → priors dominated by min_effect → safe fallback
-        return Matrix2::from_diagonal(&Vector2::new(1e12, 1e12));
-    }
-
-    let inv_det = 1.0 / det;
-    Matrix2::new(
-        d * inv_det,
-        -b * inv_det,
-        -c * inv_det,
-        a * inv_det,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,28 +254,65 @@ mod tests {
     fn test_mde_positive() {
         // With identity covariance, MDE should be positive
         let cov = Matrix9::identity();
-        let mde = estimate_mde(&cov, 100, (1e3, 1e3));
+        let mde = estimate_mde(&cov, 0.05);
 
         assert!(mde.shift_ns > 0.0, "MDE shift should be positive");
         assert!(mde.tail_ns > 0.0, "MDE tail should be positive");
     }
 
     #[test]
-    fn test_analytical_mde_well_conditioned() {
-        // Identity covariance → V = (Xᵀ X)⁻¹
-        let cov = Matrix9::identity();
-        let (mde_shift, mde_tail) = analytical_mde(&cov);
+    fn test_probit_accuracy() {
+        // Test against known values
+        assert!((probit(0.5) - 0.0).abs() < 1e-3, "probit(0.5) should be 0");
+        assert!((probit(0.975) - 1.96).abs() < 1e-2, "probit(0.975) should be ~1.96");
+        assert!((probit(0.995) - 2.576).abs() < 1e-2, "probit(0.995) should be ~2.576");
+        assert!((probit(0.025) + 1.96).abs() < 1e-2, "probit(0.025) should be ~-1.96");
+    }
 
-        // Should match known formula for identity covariance
+    #[test]
+    fn test_analytical_mde_iid_sanity_check() {
+        // For i.i.d. quantiles with Σ₀ = σ² I (σ = 1) and α = 0.05, with 80% power:
+        // - z_{0.975} ≈ 1.96, z_{0.8} ≈ 0.842
+        // - Combined z ≈ 2.80
+        // - 1ᵀ Σ⁻¹ 1 = 9, Var(μ̂) = 1/9
+        // - MDE_μ = 2.80 / 3 ≈ 0.933
+        //
+        // - bᵀ Σ⁻¹ b = 0.9375, Var(τ̂) = 1/0.9375
+        // - MDE_τ = 2.80 * sqrt(1/0.9375) ≈ 2.89
+
+        let cov = Matrix9::identity();
+        let (mde_shift, mde_tail) = analytical_mde(&cov, 0.05);
+
+        let z = 1.96 + 0.842; // z_alpha + z_power for 80% power
+        let expected_shift = z / 3.0;
+        let expected_tail = z * (1.0 / 0.9375_f64).sqrt();
+
         assert!(
-            mde_shift > 0.0 && mde_shift < 10.0,
-            "shift MDE unreasonable: {}",
+            (mde_shift - expected_shift).abs() < 0.05,
+            "shift MDE should be ~{:.3}, got {:.3}",
+            expected_shift,
             mde_shift
         );
         assert!(
-            mde_tail > 0.0 && mde_tail < 10.0,
-            "tail MDE unreasonable: {}",
+            (mde_tail - expected_tail).abs() < 0.1,
+            "tail MDE should be ~{:.3}, got {:.3}",
+            expected_tail,
             mde_tail
+        );
+    }
+
+    #[test]
+    fn test_analytical_mde_alpha_scaling() {
+        // MDE should increase with stricter alpha (smaller α → larger z → larger MDE)
+        let cov = Matrix9::identity();
+        let (mde_05, _) = analytical_mde(&cov, 0.05);  // z ≈ 1.96
+        let (mde_01, _) = analytical_mde(&cov, 0.01);  // z ≈ 2.58
+
+        assert!(
+            mde_01 > mde_05,
+            "MDE at α=0.01 ({:.3}) should be larger than α=0.05 ({:.3})",
+            mde_01,
+            mde_05
         );
     }
 
@@ -295,12 +321,11 @@ mod tests {
         // Diagonal covariance (uncorrelated quantiles)
         let mut cov = Matrix9::zeros();
         for i in 0..9 {
-            cov[(i, i)] = (i + 1) as f64; // Variance increases with quantile
+            cov[(i, i)] = (i + 1) as f64;
         }
 
-        let (mde_shift, mde_tail) = analytical_mde(&cov);
+        let (mde_shift, mde_tail) = analytical_mde(&cov, 0.05);
 
-        // Both MDEs should be positive and finite
         assert!(
             mde_shift.is_finite() && mde_shift > 0.0,
             "shift MDE not finite or positive: {}",
@@ -317,38 +342,31 @@ mod tests {
     fn test_analytical_mde_near_singular() {
         // Nearly rank-deficient covariance
         let mut cov = Matrix9::identity() * 1e-6;
-        cov[(0, 0)] = 1.0; // One large eigenvalue
+        cov[(0, 0)] = 1.0;
 
-        let (mde_shift, mde_tail) = analytical_mde(&cov);
+        let (mde_shift, mde_tail) = analytical_mde(&cov, 0.05);
 
-        // Should not panic, should return finite values
-        assert!(
-            mde_shift.is_finite(),
-            "shift MDE not finite: {}",
-            mde_shift
-        );
+        assert!(mde_shift.is_finite(), "shift MDE not finite: {}", mde_shift);
         assert!(mde_tail.is_finite(), "tail MDE not finite: {}", mde_tail);
     }
 
     #[test]
     #[cfg_attr(debug_assertions, ignore)] // Run in release mode for accurate timing
     fn test_analytical_mde_performance() {
-        // Generate a realistic covariance matrix
         let mut cov = Matrix9::identity();
         for i in 0..9 {
             for j in 0..9 {
                 let dist = (i as f64 - j as f64).abs();
-                cov[(i, j)] = (-dist / 2.0).exp(); // Exponential correlation
+                cov[(i, j)] = (-dist / 2.0).exp();
             }
         }
 
         let start = std::time::Instant::now();
         for _ in 0..1000 {
-            let _ = analytical_mde(&cov);
+            let _ = analytical_mde(&cov, 0.05);
         }
         let analytical_time = start.elapsed();
 
-        // Should complete 1000 calls in < 1ms (< 1µs per call) in release mode
         assert!(
             analytical_time.as_micros() < 1000,
             "analytical MDE too slow: {:.1}µs per call",

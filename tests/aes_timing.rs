@@ -48,28 +48,24 @@ fn aes128_block_encrypt_constant_time() {
 
     // Pre-generate inputs using InputPair helper
     const SAMPLES: usize = 100_000;
-    let inputs = InputPair::with_samples(SAMPLES, fixed_plaintext, rand_bytes_16);
+    let inputs = InputPair::new(|| fixed_plaintext, rand_bytes_16);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
         .ci_alpha(0.01)
-        .test(
-            || {
-                let mut block = (*inputs.fixed()).into();
-                cipher.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-            || {
-                let mut block = (*inputs.random()).into();
-                cipher.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-        );
+        .test(inputs, |plaintext| {
+            let mut block = plaintext.to_owned().into();
+            cipher.encrypt_block(&mut block);
+            std::hint::black_box(block[0]);
+        });
 
     eprintln!("\n[aes128_block_encrypt_constant_time]");
-    eprintln!("{}", timing_oracle::output::format_result(&result));
+    if let timing_oracle::Outcome::Completed(result) = &outcome {
+        eprintln!("{}", timing_oracle::output::format_result(&result));
+    }
 
     // Modern AES implementations should be constant-time
+    let result = outcome.unwrap_completed();
     assert!(
         result.ci_gate.passed,
         "AES-128 should be constant-time (got leak_probability={:.3})",
@@ -97,25 +93,27 @@ fn aes128_different_keys_constant_time() {
 
     let plaintext = [0x01u8; 16]; // Fixed plaintext
 
-    let result = TimingOracle::new()
+    let inputs = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(50_000)
-        .test(
-            || {
-                let mut block = plaintext.into();
+        .test(inputs, |key_idx| {
+            let mut block = plaintext.into();
+            if *key_idx == 0 {
                 cipher1.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-            || {
-                let mut block = plaintext.into();
+            } else {
                 cipher2.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-        );
+            }
+            std::hint::black_box(block[0]);
+        });
 
     eprintln!("\n[aes128_different_keys_constant_time]");
-    eprintln!("{}", timing_oracle::output::format_result(&result));
+    if let timing_oracle::Outcome::Completed(result) = &outcome {
+        eprintln!("{}", timing_oracle::output::format_result(&result));
+    }
 
     // Different keys shouldn't cause timing differences
+    let result = outcome.unwrap_completed();
     assert!(
         matches!(
             result.exploitability,
@@ -170,66 +168,54 @@ fn aes128_multiple_blocks_constant_time() {
         random_blocks_vec.push(blocks);
     }
 
-    let inputs = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let idx = std::cell::Cell::new(0);
+    let inputs = InputPair::new(
         || fixed_blocks,
-        {
-            let idx = std::cell::Cell::new(0);
-            move || {
-                let i = idx.get();
-                idx.set((i + 1) % SAMPLES);
-                random_blocks_vec[i]
-            }
+        move || {
+            let i = idx.get();
+            idx.set((i + 1) % SAMPLES);
+            random_blocks_vec[i]
         },
     );
 
     // Use alpha=0.05 to reproduce original flakiness (default is 0.01)
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
         .ci_alpha(0.05)
-        .test(
-            || {
-                let blocks = inputs.fixed();
-                let mut total = 0u8;
-                for b in blocks {
-                    let mut block = (*b).into();
-                    cipher.encrypt_block(&mut block);
-                    total ^= block[0];
-                }
-                std::hint::black_box(total)
-            },
-            || {
-                let blocks = inputs.random();
-                let mut total = 0u8;
-                for b in blocks {
-                    let mut block = (*b).into();
-                    cipher.encrypt_block(&mut block);
-                    total ^= block[0];
-                }
-                std::hint::black_box(total)
-            },
-        );
+        .test(inputs, |blocks| {
+            let mut total = 0u8;
+            for b in blocks {
+                let mut block = (*b).into();
+                cipher.encrypt_block(&mut block);
+                total ^= block[0];
+            }
+            std::hint::black_box(total);
+        });
 
     eprintln!("\n[aes128_multiple_blocks_constant_time]");
-    eprintln!("{}", timing_oracle::output::format_result(&result));
+    if let timing_oracle::Outcome::Completed(result) = &outcome {
+        eprintln!("{}", timing_oracle::output::format_result(&result));
 
-    // Debug: Show CI gate details to understand boundary behavior
-    eprintln!("\nCI Gate Debug:");
-    eprintln!("  Passed: {}", result.ci_gate.passed);
-    eprintln!("  Alpha: {}", result.ci_gate.alpha);
-    for i in 0..9 {
-        let margin = result.ci_gate.thresholds[i] - result.ci_gate.observed[i].abs();
-        eprintln!(
-            "  Q{}: obs={:7.2} thresh={:7.2} margin={:7.2} {}",
-            i + 1,
-            result.ci_gate.observed[i],
-            result.ci_gate.thresholds[i],
-            margin,
-            if margin < 0.0 { "FAIL" } else { "pass" }
-        );
+        // Debug: Show CI gate details to understand boundary behavior
+        eprintln!("\nCI Gate Debug:");
+        eprintln!("  Passed: {}", result.ci_gate.passed);
+        eprintln!("  Alpha: {}", result.ci_gate.alpha);
+        eprintln!("  Max observed: {:.2}", result.ci_gate.max_observed);
+        eprintln!("  Threshold: {:.2}", result.ci_gate.threshold);
+        let margin = result.ci_gate.threshold - result.ci_gate.max_observed;
+        eprintln!("  Margin: {:.2} {}", margin, if margin < 0.0 { "FAIL" } else { "pass" });
+        eprintln!("  Per-quantile observed:");
+        for i in 0..9 {
+            eprintln!(
+                "    Q{}: obs={:7.2}",
+                i + 1,
+                result.ci_gate.observed[i],
+            );
+        }
     }
 
     // Multiple block encryption should maintain constant-time properties
+    let result = outcome.unwrap_completed();
     assert!(
         result.ci_gate.passed,
         "AES-128 multiple blocks should be constant-time (got leak_probability={:.3})",
@@ -250,27 +236,19 @@ fn aes128_key_init_constant_time() {
 
     // Pre-generate keys using InputPair helper
     const SAMPLES: usize = 50_000;
-    let keys = InputPair::with_samples(SAMPLES, fixed_key, rand_bytes_16);
+    let keys = InputPair::new(|| fixed_key, rand_bytes_16);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // DudeCT Class 0: All-zero key
-                let key = keys.fixed();
-                let cipher = Aes128::new(key.into());
-                std::hint::black_box(cipher)
-            },
-            || {
-                // DudeCT Class 1: Random key
-                let key = keys.random();
-                let cipher = Aes128::new(key.into());
-                std::hint::black_box(cipher)
-            },
-        );
+        .test(keys, |key| {
+            let cipher = Aes128::new(key.into());
+            std::hint::black_box(cipher);
+        });
 
     eprintln!("\n[aes128_key_init_constant_time]");
-    eprintln!("{}", timing_oracle::output::format_result(&result));
+    if let timing_oracle::Outcome::Completed(result) = &outcome {
+        eprintln!("{}", timing_oracle::output::format_result(&result));
+    }
 }
 
 // ============================================================================
@@ -285,27 +263,23 @@ fn aes128_hamming_weight_independence() {
     let key = rand_bytes_16();
     let cipher = Aes128::new(&key.into());
 
-    let result = TimingOracle::new()
+    let inputs = InputPair::new(|| [0x00u8; 16], || [0xFFu8; 16]);
+
+    let outcome = TimingOracle::new()
         .samples(30_000)
-        .test(
-            || {
-                // Low Hamming weight: mostly zeros
-                let mut block = [0x00u8; 16].into();
-                cipher.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-            || {
-                // High Hamming weight: all ones
-                let mut block = [0xFFu8; 16].into();
-                cipher.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-        );
+        .test(inputs, |plaintext| {
+            let mut block = plaintext.to_owned().into();
+            cipher.encrypt_block(&mut block);
+            std::hint::black_box(block[0]);
+        });
 
     eprintln!("\n[aes128_hamming_weight_independence]");
-    eprintln!("{}", timing_oracle::output::format_result(&result));
+    if let timing_oracle::Outcome::Completed(result) = &outcome {
+        eprintln!("{}", timing_oracle::output::format_result(&result));
+    }
 
     // Hamming weight should not affect timing
+    let result = outcome.unwrap_completed();
     assert!(
         matches!(
             result.exploitability,
@@ -322,31 +296,30 @@ fn aes128_byte_pattern_independence() {
     let key = rand_bytes_16();
     let cipher = Aes128::new(&key.into());
 
-    let result = TimingOracle::new()
+    let inputs = InputPair::new(|| 0u8, || 1u8);
+
+    let outcome = TimingOracle::new()
         .samples(30_000)
-        .test(
-            || {
+        .test(inputs, |pattern_type| {
+            let mut block = [0u8; 16];
+            if *pattern_type == 0 {
                 // Sequential pattern
-                let mut block = [0u8; 16];
                 for i in 0..16 {
                     block[i] = i as u8;
                 }
-                let mut block = block.into();
-                cipher.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-            || {
+            } else {
                 // Scattered pattern (reverse)
-                let mut block = [0u8; 16];
                 for i in 0..16 {
                     block[i] = (15 - i) as u8;
                 }
-                let mut block = block.into();
-                cipher.encrypt_block(&mut block);
-                std::hint::black_box(block[0])
-            },
-        );
+            }
+            let mut block = block.into();
+            cipher.encrypt_block(&mut block);
+            std::hint::black_box(block[0]);
+        });
 
     eprintln!("\n[aes128_byte_pattern_independence]");
-    eprintln!("{}", timing_oracle::output::format_result(&result));
+    if let timing_oracle::Outcome::Completed(result) = &outcome {
+        eprintln!("{}", timing_oracle::output::format_result(&result));
+    }
 }

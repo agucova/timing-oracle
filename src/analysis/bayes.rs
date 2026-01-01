@@ -47,8 +47,18 @@ pub fn compute_bayes_factor(
     let lambda0 = prior_covariance(prior_sigmas);
     let sigma1 = sigma0 + design * lambda0 * design.transpose();
 
-    let log_bf = mvn_log_pdf_zero(observed_diff, &sigma1)
-        - mvn_log_pdf_zero(observed_diff, sigma0);
+    // Compute log BF with proper fallback handling (spec: return log BF = 0 if Cholesky fails)
+    let log_bf = match (
+        mvn_log_pdf_zero(observed_diff, &sigma1),
+        mvn_log_pdf_zero(observed_diff, sigma0),
+    ) {
+        (Some(log_pdf1), Some(log_pdf0)) => log_pdf1 - log_pdf0,
+        _ => {
+            // If either Cholesky decomposition failed, return neutral evidence (log BF = 0)
+            // Per spec: "return log BF = 0 (BF = 1, 'no evidence either way')"
+            0.0
+        }
+    };
 
     let (posterior, is_clamped) = compute_posterior_probability(log_bf, prior_no_leak);
 
@@ -82,7 +92,7 @@ pub fn compute_posterior_probability(log_bf: f64, prior_no_leak: f64) -> (f64, b
     }
 }
 
-fn build_design_matrix() -> Matrix9x2 {
+pub(crate) fn build_design_matrix() -> Matrix9x2 {
     let mut x = Matrix9x2::zeros();
     for i in 0..9 {
         x[(i, 0)] = ONES[i];
@@ -99,14 +109,18 @@ fn prior_covariance(prior_sigmas: (f64, f64)) -> Matrix2 {
     lambda0
 }
 
-fn mvn_log_pdf_zero(x: &Vector9, sigma: &Matrix9) -> f64 {
+/// Compute log pdf of MVN(0, sigma) at point x.
+///
+/// Returns None if Cholesky decomposition fails even after jitter.
+/// Per spec: caller should return log BF = 0 (neutral evidence) on failure.
+fn mvn_log_pdf_zero(x: &Vector9, sigma: &Matrix9) -> Option<f64> {
     let chol = match Cholesky::new(*sigma) {
         Some(c) => c,
         None => {
             let regularized = add_jitter(*sigma);
             match Cholesky::new(regularized) {
                 Some(c) => c,
-                None => return 0.0,
+                None => return None,
             }
         }
     };
@@ -116,12 +130,20 @@ fn mvn_log_pdf_zero(x: &Vector9, sigma: &Matrix9) -> f64 {
     let mahal_sq = z.dot(&z);
     let log_det = 2.0 * chol.l().diagonal().iter().map(|d| d.ln()).sum::<f64>();
 
-    -0.5 * (9.0 * LOG_2PI + log_det + mahal_sq)
+    Some(-0.5 * (9.0 * LOG_2PI + log_det + mahal_sq))
 }
 
+/// Add diagonal jitter for numerical stability (spec §2.6).
+///
+/// Formula: ε = 10⁻¹⁰ + (tr(Σ)/9) × 10⁻⁸
+///
+/// The base jitter (10⁻¹⁰) handles near-zero variance cases.
+/// The trace-scaled term adapts to the matrix's magnitude.
 fn add_jitter(mut sigma: Matrix9) -> Matrix9 {
-    let max_diag = (0..9).map(|i| sigma[(i, i)].abs()).fold(0.0, f64::max);
-    let jitter = 1e-9 * max_diag.max(1.0);
+    let trace: f64 = (0..9).map(|i| sigma[(i, i)]).sum();
+    let base_jitter = 1e-10;
+    let adaptive_jitter = (trace / 9.0) * 1e-8;
+    let jitter = base_jitter + adaptive_jitter;
     for i in 0..9 {
         sigma[(i, i)] += jitter;
     }
@@ -164,8 +186,32 @@ mod tests {
     fn test_mvn_log_pdf_at_zero() {
         let mean = Vector9::zeros();
         let cov = Matrix9::identity();
-        let log_pdf_at_mean = mvn_log_pdf_zero(&mean, &cov);
+        let log_pdf_at_mean = mvn_log_pdf_zero(&mean, &cov).expect("Cholesky should succeed");
         let expected = -0.5 * 9.0 * LOG_2PI;
         assert!((log_pdf_at_mean - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_bayes_factor_cholesky_fallback() {
+        // Test that when Cholesky would fail on a pathological matrix,
+        // the Bayes factor falls back to 0.0 (neutral evidence)
+        use crate::types::Vector9;
+
+        let observed_diff = Vector9::from_row_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+
+        // Create a pathological covariance with huge condition number
+        // that might cause numerical issues (though jitter often fixes it)
+        let mut pathological = Matrix9::identity();
+        for i in 0..9 {
+            pathological[(i, i)] = if i == 0 { 1e20 } else { 1e-20 };
+        }
+
+        // Even if Cholesky succeeds (due to jitter), verify the code path works
+        // The important part is that the API handles Option<f64> correctly
+        let result = compute_bayes_factor(&observed_diff, &pathological, (10.0, 10.0), 0.75);
+
+        // Result should be valid (either computed or fallback to 0.0)
+        assert!(result.log_bayes_factor.is_finite());
+        assert!(result.posterior_probability >= 0.0 && result.posterior_probability <= 1.0);
     }
 }

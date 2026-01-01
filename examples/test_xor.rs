@@ -1,27 +1,27 @@
 use timing_oracle::helpers::InputPair;
-use timing_oracle::TimingOracle;
+use timing_oracle::{Outcome, TimingOracle};
 
 fn main() {
-    const SAMPLES: usize = 100_000;
-    let inputs = InputPair::from_fn_with_samples(
-        SAMPLES,
+    // Create InputPair for tuples of two arrays
+    let inputs = InputPair::new(
         || ([0u8; 32], [0u8; 32]),
         || (rand_bytes(), rand_bytes()),
     );
 
     println!("Testing no_false_positive_xor with adaptive batching...");
-    let result = TimingOracle::new()
-        .samples(SAMPLES)
-        .test(
-            || {
-                let (a, b) = inputs.fixed();
-                xor_bytes(a, b)
-            },
-            || {
-                let (a, b) = inputs.random();
-                xor_bytes(a, b)
-            },
-        );
+    let outcome = TimingOracle::new()
+        .samples(100_000)
+        .test(inputs, |(a, b)| {
+            std::hint::black_box(xor_bytes(a, b));
+        });
+
+    let result = match outcome {
+        Outcome::Completed(r) => r,
+        Outcome::Unmeasurable { recommendation, .. } => {
+            println!("Could not measure: {}", recommendation);
+            return;
+        }
+    };
 
     println!("CI gate passed: {}", result.ci_gate.passed);
     println!("Leak probability: {:.4}", result.leak_probability);

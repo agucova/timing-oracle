@@ -7,18 +7,30 @@
 //!
 //! - macOS on Apple Silicon (M1/M2/M3)
 //! - **Must run with sudo/root privileges**
-//! - Enable with `--features kperf`
+//! - Enable with `--features kperf` (enabled by default)
 //!
 //! # Usage
+//!
+//! kperf requires root privileges. Build first, then run with sudo:
+//!
+//! ```bash
+//! cargo build --release
+//! sudo ./target/release/your_binary
+//! ```
 //!
 //! ```rust,ignore
 //! use timing_oracle::measurement::kperf::PmuTimer;
 //!
-//! // Must run as root!
-//! let timer = PmuTimer::new().expect("Failed to init PMU (run with sudo)");
-//! let cycles = timer.measure_cycles(|| {
-//!     // code to measure
-//! });
+//! match PmuTimer::new() {
+//!     Ok(mut timer) => {
+//!         let cycles = timer.measure_cycles(|| my_operation());
+//!         println!("Took {} cycles", cycles);
+//!     }
+//!     Err(e) => {
+//!         eprintln!("kperf unavailable: {}", e);
+//!         // Fall back to standard timer...
+//!     }
+//! }
 //! ```
 //!
 //! # How it works
@@ -57,7 +69,18 @@ impl std::fmt::Display for PmuError {
         match self {
             PmuError::UnsupportedPlatform => write!(f, "PMU timing requires Apple Silicon"),
             PmuError::FrameworkNotFound => write!(f, "kperf framework not found"),
-            PmuError::PermissionDenied => write!(f, "Permission denied - run with sudo"),
+            PmuError::PermissionDenied => write!(
+                f,
+                "kperf requires root privileges.\n\
+                 \n\
+                 To use cycle-accurate PMU timing:\n\
+                 \n\
+                 1. Build first:  cargo build --release\n\
+                 2. Run with sudo: sudo ./target/release/your_binary\n\
+                 \n\
+                 Alternatively, the library will fall back to the standard timer with\n\
+                 adaptive batching, which works for most cryptographic operations."
+            ),
             PmuError::ConfigurationFailed(msg) => write!(f, "PMU configuration failed: {}", msg),
         }
     }
@@ -112,11 +135,6 @@ impl PmuTimer {
 
         // Calibrate cycles per nanosecond
         let cycles_per_ns = Self::calibrate(&mut counter);
-
-        eprintln!(
-            "PMU initialized: {:.2} cycles/ns ({:.2} GHz)",
-            cycles_per_ns, cycles_per_ns
-        );
 
         Ok(Self {
             counter,

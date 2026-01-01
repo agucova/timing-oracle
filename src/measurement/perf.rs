@@ -8,18 +8,37 @@
 //! - Linux kernel with perf_event support
 //! - **Must run with sudo/root privileges** OR have `CAP_PERFMON` capability OR
 //!   `kernel.perf_event_paranoid <= 2`
-//! - Enable with `--features perf`
+//! - Enable with `--features perf` (enabled by default)
 //!
 //! # Usage
+//!
+//! perf_event may require elevated privileges. Build first, then run with sudo:
+//!
+//! ```bash
+//! cargo build --release
+//! sudo ./target/release/your_binary
+//! ```
+//!
+//! Or grant capabilities to avoid needing sudo:
+//!
+//! ```bash
+//! sudo setcap cap_perfmon=ep ./target/release/your_binary
+//! ./target/release/your_binary  # No sudo needed
+//! ```
 //!
 //! ```rust,ignore
 //! use timing_oracle::measurement::perf::LinuxPerfTimer;
 //!
-//! // May require root or capabilities!
-//! let timer = LinuxPerfTimer::new().expect("Failed to init perf (check permissions)");
-//! let cycles = timer.measure_cycles(|| {
-//!     // code to measure
-//! });
+//! match LinuxPerfTimer::new() {
+//!     Ok(mut timer) => {
+//!         let cycles = timer.measure_cycles(|| my_operation());
+//!         println!("Took {} cycles", cycles);
+//!     }
+//!     Err(e) => {
+//!         eprintln!("perf unavailable: {}", e);
+//!         // Fall back to standard timer...
+//!     }
+//! }
 //! ```
 //!
 //! # How it works
@@ -27,13 +46,6 @@
 //! Linux perf_event provides access to hardware performance monitoring counters (PMCs)
 //! that count actual CPU cycles. Unlike coarse timers on some ARM64 SoCs, PMCs run at
 //! CPU frequency (~1-5 GHz), providing sub-nanosecond resolution.
-//!
-//! # Permissions
-//!
-//! Linux perf requires one of:
-//! - Root/sudo privileges
-//! - `CAP_PERFMON` capability (kernel 5.8+)
-//! - `kernel.perf_event_paranoid <= 2` (check with `cat /proc/sys/kernel/perf_event_paranoid`)
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{compiler_fence, Ordering};
@@ -53,12 +65,25 @@ impl std::fmt::Display for PerfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PerfError::UnsupportedPlatform => write!(f, "perf timing requires Linux"),
-            PerfError::PermissionDenied => {
-                write!(
-                    f,
-                    "Permission denied - run with sudo, set CAP_PERFMON, or configure perf_event_paranoid"
-                )
-            }
+            PerfError::PermissionDenied => write!(
+                f,
+                "perf_event requires elevated privileges.\n\
+                 \n\
+                 To use cycle-accurate PMU timing, either:\n\
+                 \n\
+                 1. Run with sudo:\n\
+                    cargo build --release\n\
+                    sudo ./target/release/your_binary\n\
+                 \n\
+                 2. Grant CAP_PERFMON capability (kernel 5.8+):\n\
+                    sudo setcap cap_perfmon=ep ./target/release/your_binary\n\
+                 \n\
+                 3. Lower perf_event_paranoid (system-wide, less secure):\n\
+                    echo 2 | sudo tee /proc/sys/kernel/perf_event_paranoid\n\
+                 \n\
+                 Alternatively, the library will fall back to the standard timer with\n\
+                 adaptive batching, which works for most cryptographic operations."
+            ),
             PerfError::ConfigurationFailed(msg) => write!(f, "perf configuration failed: {}", msg),
         }
     }
@@ -116,11 +141,6 @@ impl LinuxPerfTimer {
 
         // Calibrate cycles per nanosecond
         let cycles_per_ns = Self::calibrate(&mut counter);
-
-        eprintln!(
-            "perf initialized: {:.2} cycles/ns ({:.2} GHz)",
-            cycles_per_ns, cycles_per_ns
-        );
 
         Ok(Self {
             counter,

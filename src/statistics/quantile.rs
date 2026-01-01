@@ -45,16 +45,12 @@ pub fn compute_quantile(data: &mut [f64], p: f64) -> f64 {
 
     if h_floor >= n - 1 {
         // At or beyond the last element
-        let (_, &mut max, _) = data.select_nth_unstable_by(n - 1, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let (_, &mut max, _) = data.select_nth_unstable_by(n - 1, |a, b| a.total_cmp(b));
         return max;
     }
 
     // Get the lower value using select_nth_unstable
-    let (_, &mut lower, upper) = data.select_nth_unstable_by(h_floor, |a, b| {
-        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let (_, &mut lower, upper) = data.select_nth_unstable_by(h_floor, |a, b| a.total_cmp(b));
 
     if h_frac == 0.0 {
         return lower;
@@ -64,7 +60,7 @@ pub fn compute_quantile(data: &mut [f64], p: f64) -> f64 {
     let upper_min = upper
         .iter()
         .copied()
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|a, b| a.total_cmp(b))
         .unwrap_or(lower);
 
     // Linear interpolation between lower and upper
@@ -98,10 +94,11 @@ pub fn compute_deciles(data: &[f64]) -> Vector9 {
     compute_deciles_sorted(&sorted)
 }
 
-/// Compute all 9 deciles using multi-quantile selection (O(9n) average case).
+/// Compute all 9 deciles by sorting and indexing.
 ///
-/// This is faster than sorting for computing multiple quantiles, as it only
-/// partitions the data enough to find each quantile, rather than fully sorting.
+/// Uses unstable sort (O(n log n)) followed by direct indexing for deciles.
+/// This is semantically identical to `compute_deciles()` but uses unstable
+/// sort which is faster when stability is not needed.
 ///
 /// Uses the same R-7 quantile definition as `compute_deciles_sorted` for
 /// exact result matching, including linear interpolation.
@@ -119,9 +116,11 @@ pub fn compute_deciles(data: &[f64]) -> Vector9 {
 ///
 /// Panics if `data` is empty.
 ///
-/// # Performance
+/// # Note
 ///
-/// Approximately 3-4× faster than `compute_deciles()` on typical datasets.
+/// Despite the name, this function uses O(n log n) sorting, not O(n) selection.
+/// The name is historical; true multi-quantile selection was not significantly
+/// faster in practice due to overhead.
 pub fn compute_deciles_fast(data: &[f64]) -> Vector9 {
     assert!(!data.is_empty(), "Cannot compute deciles of empty slice");
 

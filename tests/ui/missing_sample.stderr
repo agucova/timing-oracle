@@ -1,0 +1,22 @@
+error: missing required field `sample`
+
+       The `sample` field must be a closure that generates random inputs.
+
+       Example:
+       timing_test! {
+       baseline: || [0u8; 32],
+       sample: || rand::random::<[u8; 32]>(),  // <-- Add this
+       measure: |input| { ... },
+       }
+  --> tests/ui/missing_sample.rs:5:19
+   |
+ 5 |       let _result = timing_test! {
+   |  ___________________^
+ 6 | |         baseline: || 42u8,
+ 7 | |         measure: |input| {
+ 8 | |             std::hint::black_box(input);
+ 9 | |         },
+10 | |     };
+   | |_____^
+   |
+   = note: this error originates in the macro `timing_test` (in Nightly builds, run with -Z macro-backtrace for more info)

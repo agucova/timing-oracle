@@ -1,0 +1,5 @@
+error: duplicate field `baseline`
+ --> tests/ui/duplicate_field.rs:7:9
+  |
+7 |         baseline: || 43u8,  // Duplicate!
+  |         ^^^^^^^^

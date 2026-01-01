@@ -10,7 +10,7 @@
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use timing_oracle::helpers::InputPair;
-use timing_oracle::TimingOracle;
+use timing_oracle::{skip_if_unreliable, TimingOracle};
 
 // ============================================================================
 // Helper Functions Module
@@ -115,38 +115,26 @@ fn aes_sbox_timing_fast() {
 
     // Pre-generate indices using InputPair
     const SAMPLES: usize = 10_000;
-    let indices = InputPair::with_samples(SAMPLES, secret_key, rand::random::<u8>);
+    let indices = InputPair::new(|| secret_key, rand::random::<u8>);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // Fixed: always use secret_key
-                let val = std::hint::black_box(*indices.fixed());
-                std::hint::black_box(sbox[val as usize])
-            },
-            || {
-                // Random: use random byte
-                let val = std::hint::black_box(*indices.random());
-                std::hint::black_box(sbox[val as usize])
-            },
-        );
+        .test(indices, |idx| {
+            let val = std::hint::black_box(*idx);
+            std::hint::black_box(sbox[val as usize]);
+        });
+
+    // Skip if measurement is unreliable (cache timing is hard to measure on Apple Silicon)
+    let result = timing_oracle::skip_if_unreliable!(outcome, "aes_sbox_timing_fast");
 
     eprintln!("\n[aes_sbox_timing_fast]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
 
     // On many systems, S-box lookups show cache effects
     // We expect moderate leak probability or TailEffect pattern
-    // Under parallel execution (nextest), cache pollution may mask the effect
     let has_tail_effect = result.effect.as_ref()
         .map(|e| matches!(e.pattern, timing_oracle::EffectPattern::TailEffect))
         .unwrap_or(false);
-
-    // Skip assertion if measurements are too noisy (e.g., from parallel test execution)
-    if result.quality == timing_oracle::MeasurementQuality::TooNoisy {
-        eprintln!("Warning: Measurements too noisy (likely parallel execution), skipping assertion");
-        return;
-    }
 
     assert!(
         result.leak_probability > 0.3 || has_tail_effect,
@@ -164,21 +152,17 @@ fn aes_sbox_timing_thorough() {
 
     // Pre-generate indices using InputPair
     const SAMPLES: usize = 100_000;
-    let indices = InputPair::with_samples(SAMPLES, secret_key, rand::random::<u8>);
+    let indices = InputPair::new(|| secret_key, rand::random::<u8>);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
         .ci_alpha(0.01)
-        .test(
-            || {
-                let val = std::hint::black_box(*indices.fixed());
-                std::hint::black_box(sbox[val as usize])
-            },
-            || {
-                let val = std::hint::black_box(*indices.random());
-                std::hint::black_box(sbox[val as usize])
-            },
-        );
+        .test(indices, |idx| {
+            let val = std::hint::black_box(*idx);
+            std::hint::black_box(sbox[val as usize]);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[aes_sbox_timing_thorough]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -202,26 +186,20 @@ fn cache_line_boundary_effects() {
 
     // Pre-generate indices using InputPair
     const SAMPLES: usize = 10_000;
-    let indices = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let indices = InputPair::new(
         || secret_offset_same_line,
         || secret_offset_diff_line + (rand::random::<u32>() as usize % 4) * 64,
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // Access same cache line repeatedly
-                let idx = std::hint::black_box(*indices.fixed());
-                std::hint::black_box(buffer[idx])
-            },
-            || {
-                // Access different cache lines
-                let idx = std::hint::black_box(*indices.random());
-                std::hint::black_box(buffer[idx % buffer.len()])
-            },
-        );
+        .test(indices, |idx| {
+            let idx_val = std::hint::black_box(*idx);
+            std::hint::black_box(buffer[idx_val % buffer.len()]);
+        });
+
+    // Operation may be too fast on some platforms - skip if unmeasurable
+    let result = skip_if_unreliable!(outcome, "cache_line_boundary_effects");
 
     eprintln!("\n[cache_line_boundary_effects]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -239,10 +217,9 @@ fn memory_access_pattern_leak() {
     const SAMPLES: usize = 8_000;
     let data_len = data.len();
     let pattern_idx = Cell::new(0usize);
-    let indices = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let indices = InputPair::new(
         || {
-            // Cycle through secret_pattern
+            // Cycle through secret_pattern - call once to get first value
             let i = pattern_idx.get();
             let access_idx = secret_pattern[i % secret_pattern.len()];
             pattern_idx.set((i + 1) % secret_pattern.len());
@@ -251,20 +228,14 @@ fn memory_access_pattern_leak() {
         || rand::random::<u32>() as usize % data_len,
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // Sequential access pattern (predictable for CPU)
-                let access_idx = *indices.fixed();
-                std::hint::black_box(data[access_idx])
-            },
-            || {
-                // Random access pattern (less predictable)
-                let access_idx = std::hint::black_box(*indices.random());
-                std::hint::black_box(data[access_idx])
-            },
-        );
+        .test(indices, |access_idx| {
+            let access_idx_val = std::hint::black_box(*access_idx);
+            std::hint::black_box(data[access_idx_val]);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[memory_access_pattern_leak]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -285,12 +256,15 @@ fn modexp_square_and_multiply_timing() {
     // Low Hamming weight exponent (few 1 bits = fewer multiplies)
     let exp_low_hamming = BigUint::from(0x8001u32); // 2 ones
 
-    let result = TimingOracle::new()
+    let exponents = InputPair::new(|| exp_high_hamming.clone(), || exp_low_hamming.clone());
+
+    let outcome = TimingOracle::new()
         .samples(8_000)
-        .test(
-            || std::hint::black_box(helpers::modpow_naive(&base, &exp_high_hamming, &modulus)),
-            || std::hint::black_box(helpers::modpow_naive(&base, &exp_low_hamming, &modulus)),
-        );
+        .test(exponents, |exp| {
+            std::hint::black_box(helpers::modpow_naive(&base, exp, &modulus));
+        });
+
+    let result = outcome.unwrap_completed();
 
     // Print full formatted output
     eprintln!("\n{}", timing_oracle::output::format_result(&result));
@@ -331,12 +305,15 @@ fn modexp_bit_pattern_timing() {
     let exp_many_ones = BigUint::from(0xAAAAAAAAu32); // 50% ones
     let exp_few_ones = BigUint::from(0x80000001u32); // ~6% ones
 
-    let result = TimingOracle::new()
+    let exponents = InputPair::new(|| exp_many_ones.clone(), || exp_few_ones.clone());
+
+    let outcome = TimingOracle::new()
         .samples(6_000)
-        .test(
-            || std::hint::black_box(helpers::modpow_naive(&base, &exp_many_ones, &modulus)),
-            || std::hint::black_box(helpers::modpow_naive(&base, &exp_few_ones, &modulus)),
-        );
+        .test(exponents, |exp| {
+            std::hint::black_box(helpers::modpow_naive(&base, exp, &modulus));
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[modexp_bit_pattern_timing]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -362,26 +339,19 @@ fn table_lookup_small_l1() {
     // Pre-generate indices using InputPair
     const SAMPLES: usize = 10_000;
     let table_len = table.len();
-    let indices = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let indices = InputPair::new(
         || 0usize,
         || rand::random::<u32>() as usize % table_len,
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // DudeCT Class 0: All zeros
-                let idx = std::hint::black_box(*indices.fixed());
-                std::hint::black_box(table[idx])
-            },
-            || {
-                // DudeCT Class 1: Random
-                let idx = std::hint::black_box(*indices.random());
-                std::hint::black_box(table[idx])
-            },
-        );
+        .test(indices, |idx| {
+            let idx_val = std::hint::black_box(*idx);
+            std::hint::black_box(table[idx_val]);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[table_lookup_small_l1]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -402,24 +372,19 @@ fn table_lookup_medium_l2() {
     // Pre-generate indices using InputPair
     const SAMPLES: usize = 10_000;
     let table_len = table.len();
-    let indices = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let indices = InputPair::new(
         || 0usize,
         || rand::random::<u32>() as usize % table_len,
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                let idx = std::hint::black_box(*indices.fixed());
-                std::hint::black_box(table[idx])
-            },
-            || {
-                let idx = std::hint::black_box(*indices.random());
-                std::hint::black_box(table[idx])
-            },
-        );
+        .test(indices, |idx| {
+            let idx_val = std::hint::black_box(*idx);
+            std::hint::black_box(table[idx_val]);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[table_lookup_medium_l2]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -433,39 +398,28 @@ fn table_lookup_large_cache_thrash() {
     // Pre-generate indices using InputPair
     const SAMPLES: usize = 10_000;
     let table_len = table.len();
-    let indices = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let indices = InputPair::new(
         || 0usize,
         || rand::random::<u32>() as usize % table_len,
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                let idx = std::hint::black_box(*indices.fixed());
-                std::hint::black_box(table[idx])
-            },
-            || {
-                let idx = std::hint::black_box(*indices.random());
-                std::hint::black_box(table[idx])
-            },
-        );
+        .test(indices, |idx| {
+            let idx_val = std::hint::black_box(*idx);
+            std::hint::black_box(table[idx_val]);
+        });
+
+    // Skip if measurement is unreliable (cache timing is hard to measure on Apple Silicon)
+    let result = timing_oracle::skip_if_unreliable!(outcome, "table_lookup_large_cache_thrash");
 
     eprintln!("\n[table_lookup_large_cache_thrash]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
 
     // Large table should show cache timing effects
-    // Under parallel execution (nextest), cache pollution may mask the effect
     let has_tail_effect = result.effect.as_ref()
         .map(|e| matches!(e.pattern, timing_oracle::EffectPattern::TailEffect))
         .unwrap_or(false);
-
-    // Skip assertion if measurements are too noisy (e.g., from parallel test execution)
-    if result.quality == timing_oracle::MeasurementQuality::TooNoisy {
-        eprintln!("Warning: Measurements too noisy (likely parallel execution), skipping assertion");
-        return;
-    }
 
     assert!(
         result.leak_probability > 0.4 || has_tail_effect,
@@ -485,19 +439,23 @@ fn effect_pattern_pure_uniform_shift() {
     // Use a larger delay to ensure uniform shift dominates any measurement noise
     const DELAY_CYCLES: u64 = 500;
 
-    let result = TimingOracle::new()
+    let which_class = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(10_000)
-        .test(
-            || {
+        .test(which_class, |class| {
+            if *class == 0 {
                 // No delay
-                std::hint::black_box(42)
-            },
-            || {
+                std::hint::black_box(42);
+            } else {
                 // Constant delay
                 helpers::busy_wait_cycles(DELAY_CYCLES);
-                std::hint::black_box(42)
-            },
-        );
+                std::hint::black_box(42);
+            }
+        });
+
+    // Skip assertions if measurement is unreliable
+    let result = timing_oracle::skip_if_unreliable!(outcome, "effect_pattern_pure_uniform_shift");
 
     eprintln!("\n[effect_pattern_pure_uniform_shift]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -550,32 +508,38 @@ fn effect_pattern_pure_tail() {
     let spike_decisions: Vec<bool> = (0..SAMPLES)
         .map(|_| rand::random::<f64>() < TAIL_PROBABILITY)
         .collect();
-    let idx = Cell::new(0usize);
+    // Use separate counters to avoid randomized schedule scrambling the spike pattern
+    let fixed_idx = Cell::new(0usize);
+    let random_idx = Cell::new(0usize);
 
-    let result = TimingOracle::new()
+    let which_class = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                let i = idx.get();
-                idx.set(i.wrapping_add(1));
+        .test(which_class, |class| {
+            if *class == 0 {
+                let i = fixed_idx.get();
+                fixed_idx.set(i.wrapping_add(1));
                 // Base operation to ensure measurability on ARM
                 helpers::busy_wait_cycles(BASE_CYCLES);
                 // No spike regardless of decision
                 let _ = spike_decisions[i % SAMPLES];
-                std::hint::black_box(42)
-            },
-            || {
-                let i = idx.get();
-                idx.set(i.wrapping_add(1));
+                std::hint::black_box(42);
+            } else {
+                let i = random_idx.get();
+                random_idx.set(i.wrapping_add(1));
                 // Same base operation
                 helpers::busy_wait_cycles(BASE_CYCLES);
                 // Apply spike based on pre-generated decision
                 if spike_decisions[i % SAMPLES] {
                     helpers::busy_wait_cycles(EXPENSIVE_CYCLES);
                 }
-                std::hint::black_box(42)
-            },
-        );
+                std::hint::black_box(42);
+            }
+        });
+
+    // Skip assertions if measurement is unreliable
+    let result = timing_oracle::skip_if_unreliable!(outcome, "effect_pattern_pure_tail");
 
     eprintln!("\n[effect_pattern_pure_tail]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -626,21 +590,24 @@ fn effect_pattern_mixed() {
     let spike_decisions: Vec<bool> = (0..SAMPLES)
         .map(|_| rand::random::<f64>() < SPIKE_PROBABILITY)
         .collect();
-    let idx = Cell::new(0usize);
+    // Use separate counters to avoid randomized schedule scrambling the spike pattern
+    let fixed_idx = Cell::new(0usize);
+    let random_idx = Cell::new(0usize);
 
-    let result = TimingOracle::new()
+    let which_class = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                let i = idx.get();
-                idx.set(i.wrapping_add(1));
+        .test(which_class, |class| {
+            if *class == 0 {
+                let i = fixed_idx.get();
+                fixed_idx.set(i.wrapping_add(1));
                 // No delays, but access spike_decisions for identical code path
                 let _ = spike_decisions[i % SAMPLES];
-                std::hint::black_box(42)
-            },
-            || {
-                let i = idx.get();
-                idx.set(i.wrapping_add(1));
+                std::hint::black_box(42);
+            } else {
+                let i = random_idx.get();
+                random_idx.set(i.wrapping_add(1));
                 // Base delay (uniform shift)
                 helpers::busy_wait_cycles(BASE_DELAY);
 
@@ -648,9 +615,12 @@ fn effect_pattern_mixed() {
                 if spike_decisions[i % SAMPLES] {
                     helpers::busy_wait_cycles(SPIKE_DELAY);
                 }
-                std::hint::black_box(42)
-            },
-        );
+                std::hint::black_box(42);
+            }
+        });
+
+    // Skip assertions if measurement is unreliable
+    let result = timing_oracle::skip_if_unreliable!(outcome, "effect_pattern_mixed");
 
     eprintln!("\n[effect_pattern_mixed]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -691,15 +661,20 @@ fn exploitability_negligible() {
     #[cfg(target_arch = "aarch64")]
     const SMALL_DELAY: u64 = 1;
 
-    let result = TimingOracle::new()
+    let which_class = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(10_000)
-        .test(
-            || std::hint::black_box(42),
-            || {
+        .test(which_class, |class| {
+            if *class == 0 {
+                std::hint::black_box(42);
+            } else {
                 helpers::busy_wait_cycles(SMALL_DELAY);
-                std::hint::black_box(42)
-            },
-        );
+                std::hint::black_box(42);
+            }
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[exploitability_negligible]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -723,15 +698,20 @@ fn exploitability_possible_lan() {
     #[cfg(target_arch = "aarch64")]
     const MEDIUM_DELAY: u64 = 6;
 
-    let result = TimingOracle::new()
+    let which_class = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(10_000)
-        .test(
-            || std::hint::black_box(42),
-            || {
+        .test(which_class, |class| {
+            if *class == 0 {
+                std::hint::black_box(42);
+            } else {
                 helpers::busy_wait_cycles(MEDIUM_DELAY);
-                std::hint::black_box(42)
-            },
-        );
+                std::hint::black_box(42);
+            }
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[exploitability_possible_lan]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -758,15 +738,20 @@ fn exploitability_likely_lan() {
     #[cfg(target_arch = "aarch64")]
     const LARGE_DELAY: u64 = 48;
 
-    let result = TimingOracle::new()
+    let which_class = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(10_000)
-        .test(
-            || std::hint::black_box(42),
-            || {
+        .test(which_class, |class| {
+            if *class == 0 {
+                std::hint::black_box(42);
+            } else {
                 helpers::busy_wait_cycles(LARGE_DELAY);
-                std::hint::black_box(42)
-            },
-        );
+                std::hint::black_box(42);
+            }
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[exploitability_likely_lan]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -790,15 +775,20 @@ fn exploitability_possible_remote() {
     #[cfg(target_arch = "aarch64")]
     const HUGE_DELAY: u64 = 1200;
 
-    let result = TimingOracle::new()
+    let which_class = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(10_000)
-        .test(
-            || std::hint::black_box(42),
-            || {
+        .test(which_class, |class| {
+            if *class == 0 {
+                std::hint::black_box(42);
+            } else {
                 helpers::busy_wait_cycles(HUGE_DELAY);
-                std::hint::black_box(42)
-            },
-        );
+                std::hint::black_box(42);
+            }
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[exploitability_possible_remote]");
     eprintln!("{}", timing_oracle::output::format_result(&result));

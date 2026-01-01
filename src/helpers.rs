@@ -1,223 +1,487 @@
-//! Utilities for pre-generating test inputs correctly.
+//! Utilities for correct input handling in timing tests.
 //!
 //! The most common mistake when using timing-oracle is calling RNG functions
 //! or allocating memory inside the measured closures. This creates timing
 //! overhead that drowns out the actual signal.
 //!
-//! These helpers make it easy to pre-generate inputs with identical code paths.
+//! [`InputPair`] separates input generation from measurement, ensuring both
+//! closures execute identical code paths (only the data differs).
 //!
 //! # Example
 //!
 //! ```ignore
-//! use timing_oracle::{test, helpers::InputPair};
+//! use timing_oracle::helpers::InputPair;
 //!
-//! // Pre-generate inputs - RNG called BEFORE measurement
 //! let inputs = InputPair::new(
-//!     [0u8; 32],                    // Fixed value
-//!     || rand::random::<[u8; 32]>() // Generator called per sample
+//!     || [0u8; 32],                 // Baseline: closure (called per sample)
+//!     || rand::random::<[u8; 32]>() // Sample: closure (called per sample)
 //! );
 //!
-//! let result = test(
-//!     || my_function(&inputs.fixed()),   // Identical code path
-//!     || my_function(&inputs.random()),  // Identical code path
-//! );
+//! let result = timing_oracle::test(inputs, |input| {
+//!     my_function(input);
+//! });
+//!
+//! // Check for common mistakes after measurement
+//! if let Some(warning) = inputs.check_anomaly() {
+//!     eprintln!("[timing-oracle] {}", warning);
+//! }
+//! ```
+//!
+//! # Pre-generation Contract
+//!
+//! The `baseline` and `sample` closures are:
+//! - Called in batch to pre-generate all inputs before timing begins
+//! - Never invoked inside the timed region
+//! - Never interleaved with measurements
+//!
+//! Only `measure` runs inside the timed region.
+//!
+//! # Anomaly Detection
+//!
+//! `InputPair` tracks the first 1,000 sample values to detect common mistakes:
+//!
+//! ```ignore
+//! // WRONG: Captured pre-evaluated value
+//! let value = rand::random::<[u8; 32]>();
+//! let inputs = InputPair::new(|| [0u8; 32], || value);  // Always returns same!
+//!
+//! // After measurement, check_anomaly() will warn about this
 //! ```
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// Manages pre-generated fixed and random inputs for timing tests.
+/// Number of sample values to track for anomaly detection.
+/// Only the first N samples are hashed to limit memory/CPU overhead.
+pub const ANOMALY_DETECTION_WINDOW: usize = 1000;
+
+/// Minimum samples before anomaly check is meaningful.
+/// With fewer samples, low uniqueness could be coincidence.
+pub const ANOMALY_DETECTION_MIN_SAMPLES: usize = 100;
+
+/// Uniqueness threshold for warning.
+/// If unique_samples / total_samples < this, emit a warning.
+/// 0.5 means: if fewer than 50% of samples are unique, something is wrong.
+pub const ANOMALY_DETECTION_THRESHOLD: f64 = 0.5;
+
+/// Pre-generated inputs for timing tests.
 ///
-/// Automatically handles indexing and ensures both closures execute
-/// identical code paths (only the data differs).
+/// Both `baseline()` and `sample()` call their respective closures to generate
+/// values. This symmetric design ensures both classes have identical calling patterns.
 ///
 /// # Type Parameters
 ///
-/// - `T`: The input type (e.g., `[u8; 32]`, `Vec<u8>`, etc.)
+/// - `T`: The input type (e.g., `[u8; 32]`, `Vec<u8>`)
+/// - `F1`: The baseline closure type
+/// - `F2`: The sample closure type
 ///
 /// # Example
 ///
 /// ```ignore
 /// use timing_oracle::helpers::InputPair;
 ///
-/// // Bytes
-/// let bytes = InputPair::new([0u8; 32], || rand::random());
-///
-/// // Vectors
-/// let vecs = InputPair::from_fn(
-///     || vec![0u8; 1024],
-///     || (0..1024).map(|_| rand::random()).collect()
+/// // Both are closures (symmetric)
+/// let inputs = InputPair::new(
+///     || [0u8; 32],          // baseline closure
+///     || rand::random(),     // sample closure
 /// );
 ///
-/// // Use in test
-/// test(
-///     || encrypt(&bytes.fixed()),
-///     || encrypt(&bytes.random()),
-/// );
+/// // Use in test - both call their closures
+/// let baseline_val = inputs.baseline();
+/// let sample_val = inputs.sample();
 /// ```
-pub struct InputPair<T> {
-    fixed: Vec<T>,
-    random: Vec<T>,
-    fixed_index: Rc<Cell<usize>>,
-    random_index: Rc<Cell<usize>>,
+pub struct InputPair<T, F1, F2> {
+    baseline_fn: RefCell<F1>,
+    sample_fn: RefCell<F2>,
+    // Runtime anomaly detection state (tracks sample values only)
+    samples_seen: Cell<usize>,
+    unique_samples: RefCell<HashSet<u64>>,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: Clone> InputPair<T> {
-    /// Create with a fixed value and a generator for random values.
+// Main implementation for types that are Clone + Hash (with anomaly detection)
+impl<T, F1, F2> InputPair<T, F1, F2>
+where
+    T: Clone + Hash,
+    F1: FnMut() -> T,
+    F2: FnMut() -> T,
+{
+    /// Create a new input pair with anomaly detection.
     ///
-    /// The fixed value is cloned `samples` times (default 100k).
-    /// The random generator is called `samples` times to pre-generate all inputs.
+    /// Both arguments are closures that generate input values.
     ///
     /// # Arguments
     ///
-    /// * `fixed_value` - The fixed input (cloned for all samples)
-    /// * `random_gen` - Function that generates one random input
+    /// - `baseline`: Closure that generates the baseline value (typically constant)
+    /// - `sample`: Closure that generates varied sample values
+    ///
+    /// # Type Requirements
+    ///
+    /// - `T: Clone` for internal operations
+    /// - `T: Hash` for anomaly detection (use [`new_untracked`](Self::new_untracked) for non-Hash types)
     ///
     /// # Example
     ///
     /// ```ignore
     /// let inputs = InputPair::new(
-    ///     [0u8; 32],
-    ///     || rand::random::<[u8; 32]>()
+    ///     || [0u8; 32],                // baseline: returns constant value
+    ///     || rand::random::<[u8; 32]>() // sample: generates varied values
     /// );
     /// ```
-    pub fn new<F>(fixed_value: T, random_gen: F) -> Self
-    where
-        F: Fn() -> T,
-    {
-        Self::with_samples(100_000, fixed_value, random_gen)
-    }
-
-    /// Create with explicit sample count.
-    ///
-    /// Use this to match your `TimingOracle` configuration:
-    ///
-    /// ```ignore
-    /// let inputs = InputPair::with_samples(
-    ///     50_000,  // Match .samples(50_000)
-    ///     [0u8; 32],
-    ///     || rand::random()
-    /// );
-    /// ```
-    pub fn with_samples<F>(samples: usize, fixed_value: T, random_gen: F) -> Self
-    where
-        F: Fn() -> T,
-    {
-        let fixed = vec![fixed_value; samples];
-        let random = (0..samples).map(|_| random_gen()).collect();
-
+    pub fn new(baseline: F1, sample: F2) -> Self {
         Self {
-            fixed,
-            random,
-            fixed_index: Rc::new(Cell::new(0)),
-            random_index: Rc::new(Cell::new(0)),
+            baseline_fn: RefCell::new(baseline),
+            sample_fn: RefCell::new(sample),
+            samples_seen: Cell::new(0),
+            unique_samples: RefCell::new(HashSet::new()),
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Create from separate generators for both fixed and random.
+    /// Generate a baseline value by calling the baseline closure.
     ///
-    /// Use when the fixed input also needs generation logic:
+    /// Returns `T` by calling the baseline closure each time.
     ///
     /// ```ignore
-    /// let inputs = InputPair::from_fn(
-    ///     || vec![0u8; 1024],      // Fixed generator
-    ///     || rand::random_vec(1024) // Random generator
-    /// );
+    /// let inputs = InputPair::new(|| [0u8; 32], || rand::random());
+    /// let val = inputs.baseline();  // Calls || [0u8; 32]
     /// ```
-    pub fn from_fn<FF, FR>(fixed_gen: FF, random_gen: FR) -> Self
-    where
-        FF: Fn() -> T,
-        FR: Fn() -> T,
-    {
-        Self::from_fn_with_samples(100_000, fixed_gen, random_gen)
+    #[inline]
+    pub fn baseline(&self) -> T {
+        (self.baseline_fn.borrow_mut())()
     }
 
-    /// Create from generators with explicit sample count.
-    pub fn from_fn_with_samples<FF, FR>(
-        samples: usize,
-        fixed_gen: FF,
-        random_gen: FR,
-    ) -> Self
-    where
-        FF: Fn() -> T,
-        FR: Fn() -> T,
-    {
-        let fixed = (0..samples).map(|_| fixed_gen()).collect();
-        let random = (0..samples).map(|_| random_gen()).collect();
+    /// Generate a sample value with anomaly tracking.
+    ///
+    /// Calls the sample closure and tracks the hash for anomaly detection
+    /// (only the first [`ANOMALY_DETECTION_WINDOW`] samples are tracked).
+    ///
+    /// **Note:** This method includes tracking overhead. For timing-critical code,
+    /// use `generate_sample()` during pre-generation and check anomalies after.
+    #[inline]
+    pub fn sample(&self) -> T {
+        let value = self.generate_sample();
 
-        Self {
-            fixed,
-            random,
-            fixed_index: Rc::new(Cell::new(0)),
-            random_index: Rc::new(Cell::new(0)),
+        // Track for anomaly detection (only first N samples)
+        let count = self.samples_seen.get();
+        if count < ANOMALY_DETECTION_WINDOW {
+            self.samples_seen.set(count + 1);
+            // Hash-based uniqueness tracking (avoids storing full values)
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            self.unique_samples.borrow_mut().insert(hasher.finish());
+        }
+
+        value
+    }
+
+    /// Generate a sample value without anomaly tracking.
+    ///
+    /// Use this for pre-generating inputs before measurement. After pre-generation,
+    /// call `track_value()` on each value to enable anomaly detection.
+    ///
+    /// This is used internally by `TimingOracle::test()` to avoid overhead
+    /// during the measurement loop.
+    #[inline]
+    pub fn generate_sample(&self) -> T {
+        (self.sample_fn.borrow_mut())()
+    }
+
+    /// Generate a baseline value without any overhead.
+    ///
+    /// Identical to `baseline()` but named for symmetry with `generate_sample()`.
+    #[inline]
+    pub fn generate_baseline(&self) -> T {
+        (self.baseline_fn.borrow_mut())()
+    }
+
+    /// Track a sample value for anomaly detection.
+    ///
+    /// Call this on pre-generated sample values to enable anomaly detection without
+    /// adding overhead during measurement.
+    #[inline]
+    pub fn track_value(&self, value: &T) {
+        let count = self.samples_seen.get();
+        if count < ANOMALY_DETECTION_WINDOW {
+            self.samples_seen.set(count + 1);
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            self.unique_samples.borrow_mut().insert(hasher.finish());
         }
     }
 
-    /// Get the next fixed input.
+    /// Check if the sample generator appears to be producing constant values.
     ///
-    /// Intended for single-threaded use; relies on `Cell` for interior mutability.
-    /// Wraps around when reaching the end.
-    /// Uses a separate index from `random()` so alternating calls work correctly.
-    #[inline]
-    pub fn fixed(&self) -> &T {
-        let i = self.fixed_index.get();
-        self.fixed_index.set(i.wrapping_add(1));
-        &self.fixed[i % self.fixed.len()]
+    /// Returns a warning message if anomaly detected, `None` otherwise.
+    /// Should be called after measurement completes.
+    ///
+    /// # Detected Anomalies
+    ///
+    /// | Condition | Severity | Message |
+    /// |-----------|----------|---------|
+    /// | All samples identical | Error | Likely captured pre-evaluated value |
+    /// | <50% unique samples | Warning | Low entropy, possible mistake |
+    /// | Normal entropy | OK | None |
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // After running the test
+    /// if let Some(warning) = inputs.check_anomaly() {
+    ///     eprintln!("[timing-oracle] {}", warning);
+    /// }
+    /// ```
+    pub fn check_anomaly(&self) -> Option<String> {
+        let count = self.samples_seen.get();
+        if count < ANOMALY_DETECTION_MIN_SAMPLES {
+            return None; // Not enough samples to judge
+        }
+
+        let unique = self.unique_samples.borrow().len();
+        let unique_ratio = unique as f64 / count as f64;
+
+        if unique == 1 {
+            Some(format!(
+                "ANOMALY: sample() returned identical values for all {} samples. \
+                 Did you accidentally capture a pre-evaluated value instead of a closure? \
+                 Use `sample: || expr` not `sample: expr`.",
+                count
+            ))
+        } else if unique_ratio < ANOMALY_DETECTION_THRESHOLD {
+            Some(format!(
+                "WARNING: sample() produced only {} unique values out of {} samples \
+                 ({:.1}% unique). Expected high entropy for sample inputs.",
+                unique,
+                count,
+                unique_ratio * 100.0
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+// Implementation for types that are Clone but not Hash (untracked version)
+impl<T, F1, F2> InputPair<T, F1, F2>
+where
+    T: Clone,
+    F1: FnMut() -> T,
+    F2: FnMut() -> T,
+{
+    /// Create without anomaly detection (for non-Hash types).
+    ///
+    /// Use this when `T` doesn't implement `Hash` (e.g., cryptographic scalars,
+    /// field elements, big integers).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Scalar type that doesn't implement Hash
+    /// let inputs = InputPair::new_untracked(
+    ///     || Scalar::zero(),
+    ///     || Scalar::random(&mut rng)
+    /// );
+    /// ```
+    pub fn new_untracked(baseline: F1, sample: F2) -> Self {
+        Self {
+            baseline_fn: RefCell::new(baseline),
+            sample_fn: RefCell::new(sample),
+            samples_seen: Cell::new(0),
+            unique_samples: RefCell::new(HashSet::new()),
+            _phantom: std::marker::PhantomData,
+        }
     }
 
-    /// Get the next random input.
-    ///
-    /// Intended for single-threaded use; relies on `Cell` for interior mutability.
-    /// Wraps around when reaching the end.
-    /// Uses a separate index from `fixed()` so alternating calls work correctly.
+    /// Generate a baseline value (untracked version).
     #[inline]
-    pub fn random(&self) -> &T {
-        let i = self.random_index.get();
-        self.random_index.set(i.wrapping_add(1));
-        &self.random[i % self.random.len()]
+    pub fn baseline_untracked(&self) -> T {
+        (self.baseline_fn.borrow_mut())()
     }
 
-    /// Reset both index counters to 0.
+    /// Generate a sample value without tracking (for non-Hash types).
+    #[inline]
+    pub fn sample_untracked(&self) -> T {
+        (self.sample_fn.borrow_mut())()
+    }
+
+    /// Check anomaly - always returns None for untracked InputPairs.
     ///
-    /// Rarely needed - mainly for testing the helper itself.
-    pub fn reset(&self) {
-        self.fixed_index.set(0);
-        self.random_index.set(0);
+    /// This method exists so code can call `check_anomaly()` uniformly
+    /// without knowing whether tracking is enabled.
+    pub fn check_anomaly_untracked(&self) -> Option<String> {
+        None
     }
 }
 
 // Convenience constructors for common types
 
-/// Helper for byte arrays.
+/// Helper for 32-byte arrays (common in cryptography).
+///
+/// Creates an `InputPair` with:
+/// - Baseline: all zeros `[0u8; 32]`
+/// - Sample: `rand::random()`
 ///
 /// # Example
 ///
 /// ```ignore
-/// use timing_oracle::helpers;
+/// use timing_oracle::helpers::byte_arrays_32;
 ///
-/// let inputs = helpers::byte_arrays_32();
-/// // Equivalent to InputPair::new([0u8; 32], || rand::random())
+/// let inputs = byte_arrays_32();
+/// timing_oracle::test(inputs, |input| {
+///     encrypt(input);
+/// });
 /// ```
-pub fn byte_arrays_32() -> InputPair<[u8; 32]> {
-    InputPair::new([0u8; 32], rand::random)
+pub fn byte_arrays_32() -> InputPair<[u8; 32], impl FnMut() -> [u8; 32], impl FnMut() -> [u8; 32]> {
+    InputPair::new(|| [0u8; 32], rand::random)
 }
 
 /// Helper for byte vectors of specific length.
 ///
+/// Creates an `InputPair` with:
+/// - Baseline: all zeros `vec![0u8; len]`
+/// - Sample: random bytes of length `len`
+///
 /// # Example
 ///
 /// ```ignore
-/// use timing_oracle::helpers;
+/// use timing_oracle::helpers::byte_vecs;
 ///
-/// let inputs = helpers::byte_vecs(1024);
-/// test(
-///     || encrypt(&inputs.fixed()),
-///     || encrypt(&inputs.random()),
-/// );
+/// let inputs = byte_vecs(1024);
+/// timing_oracle::test(inputs, |input| {
+///     encrypt(input);
+/// });
 /// ```
-pub fn byte_vecs(len: usize) -> InputPair<Vec<u8>> {
-    InputPair::from_fn(
-        || vec![0u8; len],
-        || (0..len).map(|_| rand::random()).collect(),
+pub fn byte_vecs(len: usize) -> InputPair<Vec<u8>, impl FnMut() -> Vec<u8>, impl FnMut() -> Vec<u8>> {
+    InputPair::new(
+        move || vec![0u8; len],
+        move || (0..len).map(|_| rand::random()).collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_input_pair_basic() {
+        let inputs = InputPair::new(|| 42u64, || 100u64);
+
+        assert_eq!(inputs.baseline(), 42);
+        assert_eq!(inputs.sample(), 100);
+        assert_eq!(inputs.baseline(), 42); // Still 42 (closure returns constant)
+    }
+
+    #[test]
+    fn test_input_pair_generator_called_each_time() {
+        let counter = Cell::new(0u64);
+        let inputs = InputPair::new(
+            || 0u64,
+            || {
+                let val = counter.get();
+                counter.set(val + 1);
+                val
+            },
+        );
+
+        assert_eq!(inputs.sample(), 0);
+        assert_eq!(inputs.sample(), 1);
+        assert_eq!(inputs.sample(), 2);
+    }
+
+    #[test]
+    fn test_anomaly_detection_constant() {
+        let constant_value = 42u64;
+        let inputs = InputPair::new(|| 0u64, || constant_value);
+
+        // Generate enough samples to trigger detection
+        for _ in 0..200 {
+            let _ = inputs.sample();
+        }
+
+        let anomaly = inputs.check_anomaly();
+        assert!(anomaly.is_some());
+        assert!(anomaly.unwrap().contains("ANOMALY"));
+    }
+
+    #[test]
+    fn test_anomaly_detection_good_entropy() {
+        let counter = Cell::new(0u64);
+        let inputs = InputPair::new(
+            || 0u64,
+            || {
+                let val = counter.get();
+                counter.set(val + 1);
+                val // Each value is unique
+            },
+        );
+
+        for _ in 0..200 {
+            let _ = inputs.sample();
+        }
+
+        assert!(inputs.check_anomaly().is_none());
+    }
+
+    #[test]
+    fn test_anomaly_detection_low_entropy() {
+        let counter = Cell::new(0u64);
+        let inputs = InputPair::new(
+            || 0u64,
+            || {
+                let val = counter.get() % 10; // Only 10 unique values
+                counter.set(counter.get() + 1);
+                val
+            },
+        );
+
+        for _ in 0..200 {
+            let _ = inputs.sample();
+        }
+
+        let anomaly = inputs.check_anomaly();
+        assert!(anomaly.is_some());
+        assert!(anomaly.unwrap().contains("WARNING"));
+    }
+
+    #[test]
+    fn test_anomaly_detection_insufficient_samples() {
+        let inputs = InputPair::new(|| 0u64, || 42u64);
+
+        // Only 50 samples - below minimum
+        for _ in 0..50 {
+            let _ = inputs.sample();
+        }
+
+        // Should return None (not enough samples)
+        assert!(inputs.check_anomaly().is_none());
+    }
+
+    #[test]
+    fn test_untracked_version() {
+        let inputs = InputPair::new_untracked(|| 0u64, || 42u64);
+
+        assert_eq!(inputs.baseline_untracked(), 0);
+        assert_eq!(inputs.sample_untracked(), 42);
+        assert!(inputs.check_anomaly_untracked().is_none());
+    }
+
+    #[test]
+    fn test_byte_arrays_32() {
+        let inputs = byte_arrays_32();
+        assert_eq!(inputs.baseline(), [0u8; 32]);
+        // sample() should return different values (with high probability)
+        let r1 = inputs.sample();
+        let r2 = inputs.sample();
+        // Very unlikely to be equal if truly random
+        assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn test_byte_vecs() {
+        let inputs = byte_vecs(64);
+        assert_eq!(inputs.baseline(), vec![0u8; 64]);
+        assert_eq!(inputs.baseline().len(), 64);
+        assert_eq!(inputs.sample().len(), 64);
+    }
 }

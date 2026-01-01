@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use timing_oracle::helpers::InputPair;
 use timing_oracle::{CiFailure, CiTestBuilder, FailCriterion, Mode};
 
 struct EnvGuard {
@@ -41,6 +42,15 @@ fn temp_report_path(name: &str) -> PathBuf {
     path
 }
 
+// Helper for simulating timing difference via iteration count
+fn do_iterations(count: &u32) {
+    let mut x = 0u64;
+    for i in 0..*count {
+        x = x.wrapping_add(std::hint::black_box(i as u64));
+    }
+    std::hint::black_box(x);
+}
+
 #[test]
 fn env_merge_and_fail_on_probability() {
     let _g1 = EnvGuard::set("TO_MODE", "full");
@@ -56,25 +66,10 @@ fn env_merge_and_fail_on_probability() {
     let _g10 = EnvGuard::set("TO_REPORT", report_path.to_str().unwrap());
 
     let builder = CiTestBuilder::new().from_env();
-    match builder.run(
-        || {
-            // Make measurable with busy work (~1000ns on ARM, >10 ticks)
-            // Higher count needed for concurrent test execution
-            let mut x = 0u64;
-            for i in 0..1000 {
-                x = x.wrapping_add(std::hint::black_box(i));
-            }
-            std::hint::black_box(x)
-        },
-        || {
-            // Slightly different - extra iterations to create timing difference
-            let mut x = 0u64;
-            for i in 0..1100 {
-                x = x.wrapping_add(std::hint::black_box(i));
-            }
-            std::hint::black_box(x)
-        },
-    ) {
+    // Fixed: 1000 iterations, Random: 1100 iterations (creates timing diff)
+    let inputs = InputPair::new(|| 1000u32, || 1100u32);
+
+    match builder.run(inputs, do_iterations) {
         Err(CiFailure::LeakDetected { outcome }) => {
             assert_eq!(outcome.mode, Mode::Full);
             assert_eq!(outcome.config.samples, 25);
@@ -93,7 +88,10 @@ fn env_merge_and_fail_on_probability() {
             assert_eq!(outcome.report_path.as_ref(), Some(&report_path));
             assert!(report_path.exists(), "report should be written");
         }
-        other => panic!("expected leak detected due to prob=0.0 fail_on, got {:?}", other),
+        other => panic!(
+            "expected leak detected due to prob=0.0 fail_on, got {:?}",
+            other
+        ),
     }
 
     // Clean up the report file if it was created.
@@ -107,27 +105,14 @@ fn async_flag_inflates_priors_and_thresholds() {
         .samples(40)
         .fail_on(FailCriterion::Probability(0.0));
 
-    match builder.run(
-        || {
-            // Make measurable with busy work (~1000ns on ARM, >10 ticks)
-            // Higher count needed for concurrent test execution
-            let mut x = 0u64;
-            for i in 0..1000 {
-                x = x.wrapping_add(std::hint::black_box(i));
-            }
-            std::hint::black_box(x)
-        },
-        || {
-            // Slightly different - extra iterations to create timing difference
-            let mut x = 0u64;
-            for i in 0..1100 {
-                x = x.wrapping_add(std::hint::black_box(i));
-            }
-            std::hint::black_box(x)
-        },
-    ) {
+    let inputs = InputPair::new(|| 1000u32, || 1100u32);
+
+    match builder.run(inputs, do_iterations) {
         Err(CiFailure::LeakDetected { outcome }) => {
-            assert!(outcome.async_workload, "async flag should propagate to outcome");
+            assert!(
+                outcome.async_workload,
+                "async flag should propagate to outcome"
+            );
             assert!(
                 outcome.config.min_effect_of_concern_ns >= 30.0,
                 "async mode should inflate effect prior"
@@ -138,7 +123,10 @@ fn async_flag_inflates_priors_and_thresholds() {
                 "async mode sets default effect threshold when absent"
             );
         }
-        other => panic!("expected leak detected due to prob=0.0 fail_on, got {:?}", other),
+        other => panic!(
+            "expected leak detected due to prob=0.0 fail_on, got {:?}",
+            other
+        ),
     }
 }
 
@@ -151,25 +139,9 @@ fn report_contains_metadata() {
         .fail_on(FailCriterion::Probability(0.0))
         .report_path(&report_path);
 
-    match builder.run(
-        || {
-            // Make measurable with busy work (~1000ns on ARM, >10 ticks)
-            // Higher count needed for concurrent test execution
-            let mut x = 0u64;
-            for i in 0..1000 {
-                x = x.wrapping_add(std::hint::black_box(i));
-            }
-            std::hint::black_box(x)
-        },
-        || {
-            // Slightly different - extra iterations to create timing difference
-            let mut x = 0u64;
-            for i in 0..1100 {
-                x = x.wrapping_add(std::hint::black_box(i));
-            }
-            std::hint::black_box(x)
-        },
-    ) {
+    let inputs = InputPair::new(|| 1000u32, || 1100u32);
+
+    match builder.run(inputs, do_iterations) {
         Err(CiFailure::LeakDetected { outcome: _ }) => {
             assert!(report_path.exists(), "report should be written");
             let contents = fs::read_to_string(&report_path).expect("read report");
@@ -190,7 +162,10 @@ fn report_contains_metadata() {
                 "config fields should be present in report"
             );
         }
-        other => panic!("expected leak detected due to prob=0.0 fail_on, got {:?}", other),
+        other => panic!(
+            "expected leak detected due to prob=0.0 fail_on, got {:?}",
+            other
+        ),
     }
 
     let _ = fs::remove_file(&report_path);

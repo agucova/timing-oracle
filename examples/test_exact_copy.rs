@@ -1,6 +1,6 @@
 //! Tests that must not false-positive on constant-time code.
 use timing_oracle::helpers::InputPair;
-use timing_oracle::TimingOracle;
+use timing_oracle::{Outcome, TimingOracle};
 
 fn main() {
     test_no_false_positive_xor_compare();
@@ -10,21 +10,28 @@ fn test_no_false_positive_xor_compare() {
     let secret = [0xABu8; 32];
 
     // Pre-generate inputs using InputPair
-    const SAMPLES: usize = 100_000;
-    let inputs = InputPair::with_samples(SAMPLES, [0xABu8; 32], rand_bytes);
+    let inputs = InputPair::new(|| [0xABu8; 32], rand_bytes);
 
-    let result = TimingOracle::new()
-        .samples(SAMPLES)
-        .test(
-            || constant_time_compare(&secret, inputs.fixed()),
-            || constant_time_compare(&secret, inputs.random()),
-        );
+    let outcome = TimingOracle::new().samples(100_000).test(inputs, |data| {
+        constant_time_compare(&secret, data);
+    });
+
+    let result = match outcome {
+        Outcome::Completed(r) => r,
+        Outcome::Unmeasurable { .. } => {
+            println!("Operation too fast to measure");
+            return;
+        }
+    };
 
     println!("Leak probability: {}", result.leak_probability);
     println!("CI gate passed: {}", result.ci_gate.passed);
-    
+
     if result.leak_probability > 0.5 {
-        println!("ERROR: False positive! leak_probability={}", result.leak_probability);
+        println!(
+            "ERROR: False positive! leak_probability={}",
+            result.leak_probability
+        );
     } else {
         println!("OK: No false positive detected");
     }

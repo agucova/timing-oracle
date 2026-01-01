@@ -4,6 +4,7 @@
 //! - High-resolution cycle counting with platform-specific implementations
 //! - Sample collection with randomized interleaved design
 //! - Symmetric outlier filtering for robust analysis
+//! - Unified timer trait for cross-platform PMU support
 //!
 //! # Timer Selection
 //!
@@ -17,20 +18,40 @@
 //! - Ampere Altra: ~40ns (25 MHz)
 //! - Raspberry Pi 4: ~18ns (54 MHz)
 //!
-//! On ARM64 with coarse timers, the library automatically batches iterations
-//! to compensate for timer resolution. On macOS, for cycle-accurate timing,
-//! enable the `kperf` feature and run with sudo:
+//! # Automatic PMU Detection
 //!
-//! ```toml
-//! [dependencies]
-//! timing-oracle = { version = "0.1", features = ["kperf"] }
-//! ```
+//! When running with sudo/root privileges, the library automatically uses
+//! cycle-accurate PMU timing:
+//! - **macOS ARM64**: kperf (~0.3ns resolution)
+//! - **Linux**: perf_event (~0.3ns resolution)
+//!
+//! No code changes needed - just run with sudo:
 //!
 //! ```bash
-//! sudo cargo test
+//! cargo build --release
+//! sudo ./target/release/your_binary
+//! ```
+//!
+//! # Manual Timer Selection
+//!
+//! Use `TimerSpec` to explicitly control timer selection:
+//!
+//! ```ignore
+//! use timing_oracle::{TimingOracle, TimerSpec};
+//!
+//! // Force standard timer (no PMU)
+//! let result = TimingOracle::new()
+//!     .timer_spec(TimerSpec::Standard)
+//!     .test(...);
+//!
+//! // Prefer PMU with fallback
+//! let result = TimingOracle::new()
+//!     .timer_spec(TimerSpec::PreferPmu)
+//!     .test(...);
 //! ```
 
 mod collector;
+mod cycle_timer;
 mod outlier;
 mod timer;
 
@@ -40,6 +61,7 @@ pub mod kperf;
 #[cfg(feature = "perf")]
 pub mod perf;
 
-pub use collector::{Collector, Sample};
+pub use collector::{Collector, Sample, MIN_TICKS_SINGLE_CALL};
+pub use cycle_timer::{BoxedTimer, TimerSpec};
 pub use outlier::{filter_outliers, OutlierStats};
 pub use timer::{black_box, cycles_per_ns, rdtsc, Timer};

@@ -29,11 +29,14 @@ fn main() {
     let n_simulations = 100;
     let prior_sigmas = (1e6, 1e6);
 
+    // Parameters for MDE calculations
+    let alpha = 0.01; // Same as default CI alpha
+
     // Warmup runs
     println!("Running warmup iterations...");
     for _ in 0..3 {
         let _ = estimate_mde_monte_carlo(covariance, n_simulations, prior_sigmas);
-        let _ = analytical_mde(covariance);
+        let _ = analytical_mde(covariance, alpha);
     }
 
     // Benchmark Monte Carlo method
@@ -68,7 +71,7 @@ fn main() {
 
     for run in 0..10 {
         let start = Instant::now();
-        let (shift, tail) = analytical_mde(covariance);
+        let (shift, tail) = analytical_mde(covariance, alpha);
         let elapsed = start.elapsed();
         analytical_times.push(elapsed);
         analytical_results.push((shift, tail));

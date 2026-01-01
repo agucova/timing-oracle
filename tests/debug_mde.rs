@@ -1,8 +1,8 @@
 //! Temporary diagnostic test for MDE issue
 
-use timing_oracle::TimingOracle;
 use timing_oracle::helpers::InputPair;
 use timing_oracle::statistics::compute_deciles;
+use timing_oracle::TimingOracle;
 
 fn generate_sbox() -> [u8; 256] {
     let mut sbox = [0u8; 256];
@@ -20,7 +20,7 @@ fn debug_raw_timing() {
     let sbox = generate_sbox();
     let secret_key = 0xABu8;
 
-    let indices = InputPair::with_samples(1000, secret_key, rand::random::<u8>);
+    let indices = InputPair::new(|| secret_key, || rand::random::<u8>());
 
     let timer = Timer::new();
     let collector = Collector::with_timer(timer.clone(), 100);
@@ -28,18 +28,24 @@ fn debug_raw_timing() {
     let (fixed_cycles, random_cycles, _batching_info) = collector.collect_separated(
         1000,
         || {
-            let val = std::hint::black_box(*indices.fixed());
+            let val = std::hint::black_box(indices.baseline());
             std::hint::black_box(sbox[val as usize])
         },
         || {
-            let val = std::hint::black_box(*indices.random());
+            let val = std::hint::black_box(indices.sample());
             std::hint::black_box(sbox[val as usize])
         },
     );
 
     // Convert to ns
-    let fixed_ns: Vec<f64> = fixed_cycles.iter().map(|&c| timer.cycles_to_ns(c)).collect();
-    let random_ns: Vec<f64> = random_cycles.iter().map(|&c| timer.cycles_to_ns(c)).collect();
+    let fixed_ns: Vec<f64> = fixed_cycles
+        .iter()
+        .map(|&c| timer.cycles_to_ns(c))
+        .collect();
+    let random_ns: Vec<f64> = random_cycles
+        .iter()
+        .map(|&c| timer.cycles_to_ns(c))
+        .collect();
 
     // Count unique values
     let mut fixed_sorted = fixed_ns.clone();
@@ -58,8 +64,14 @@ fn debug_raw_timing() {
     eprintln!("Random unique values: {}", random_sorted.len());
 
     // Show first 20 unique values
-    eprintln!("\nFixed unique values (first 20): {:?}", &fixed_sorted[..fixed_sorted.len().min(20)]);
-    eprintln!("Random unique values (first 20): {:?}", &random_sorted[..random_sorted.len().min(20)]);
+    eprintln!(
+        "\nFixed unique values (first 20): {:?}",
+        &fixed_sorted[..fixed_sorted.len().min(20)]
+    );
+    eprintln!(
+        "Random unique values (first 20): {:?}",
+        &random_sorted[..random_sorted.len().min(20)]
+    );
 
     // Basic stats
     let fixed_min = fixed_ns.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -76,7 +88,10 @@ fn debug_raw_timing() {
 
     eprintln!("\nFixed deciles:  {:?}", fixed_deciles.as_slice());
     eprintln!("Random deciles: {:?}", random_deciles.as_slice());
-    eprintln!("Difference:     {:?}", (fixed_deciles - random_deciles).as_slice());
+    eprintln!(
+        "Difference:     {:?}",
+        (fixed_deciles - random_deciles).as_slice()
+    );
     eprintln!("==============================\n");
 }
 
@@ -86,27 +101,27 @@ fn debug_mde_issue() {
     let secret_key = 0xABu8;
 
     const SAMPLES: usize = 10_000;
-    let indices = InputPair::with_samples(SAMPLES, secret_key, rand::random::<u8>);
+    let indices = InputPair::new(|| secret_key, || rand::random::<u8>());
 
-    let result = TimingOracle::new()
-        .samples(SAMPLES)
-        .test(
-            || {
-                let val = std::hint::black_box(*indices.fixed());
-                std::hint::black_box(sbox[val as usize])
-            },
-            || {
-                let val = std::hint::black_box(*indices.random());
-                std::hint::black_box(sbox[val as usize])
-            },
-        );
+    let outcome = TimingOracle::new().samples(SAMPLES).test(indices, |idx| {
+        std::hint::black_box(());
+        std::hint::black_box(sbox[*idx as usize]);
+    });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n=== DIAGNOSTIC OUTPUT ===");
     eprintln!("Samples per class: {}", result.metadata.samples_per_class);
     eprintln!("Cycles per ns: {}", result.metadata.cycles_per_ns);
     eprintln!("Timer: {}", result.metadata.timer);
-    eprintln!("Timer resolution: {} ns", result.metadata.timer_resolution_ns);
-    eprintln!("Batching enabled: {}, k={}", result.metadata.batching.enabled, result.metadata.batching.k);
+    eprintln!(
+        "Timer resolution: {} ns",
+        result.metadata.timer_resolution_ns
+    );
+    eprintln!(
+        "Batching enabled: {}, k={}",
+        result.metadata.batching.enabled, result.metadata.batching.k
+    );
     eprintln!("Outlier fraction: {}", result.outlier_fraction);
     eprintln!();
     eprintln!("MDE shift_ns: {}", result.min_detectable_effect.shift_ns);
@@ -115,8 +130,9 @@ fn debug_mde_issue() {
     eprintln!();
     eprintln!("CI Gate passed: {}", result.ci_gate.passed);
     eprintln!("CI Gate alpha: {}", result.ci_gate.alpha);
-    eprintln!("CI Gate thresholds: {:?}", result.ci_gate.thresholds);
-    eprintln!("CI Gate observed:   {:?}", result.ci_gate.observed);
+    eprintln!("CI Gate threshold: {:.2}", result.ci_gate.threshold);
+    eprintln!("CI Gate max_observed: {:.2}", result.ci_gate.max_observed);
+    eprintln!("CI Gate observed: {:?}", result.ci_gate.observed);
     eprintln!();
     eprintln!("Leak probability: {}", result.leak_probability);
     eprintln!("Exploitability: {:?}", result.exploitability);

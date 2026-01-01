@@ -37,10 +37,12 @@ pub struct CovarianceEstimate {
 impl CovarianceEstimate {
     /// Check if the covariance matrix is numerically stable.
     ///
-    /// A matrix is considered stable if its minimum eigenvalue is
-    /// sufficiently positive (not near-singular).
+    /// A matrix is stable if Cholesky decomposition succeeds, which
+    /// is both necessary and sufficient for positive definiteness.
+    /// The Gershgorin bound is only a lower bound on eigenvalues and
+    /// can be negative even for positive definite matrices.
     pub fn is_stable(&self) -> bool {
-        self.min_eigenvalue > 1e-10
+        nalgebra::Cholesky::new(self.matrix).is_some()
     }
 }
 
@@ -104,10 +106,14 @@ impl WelfordCovariance9 {
     /// Finalize the accumulator and return the covariance matrix.
     ///
     /// Returns M2/(n-1) for the unbiased sample covariance estimator.
-    /// For n < 2, returns the identity matrix (degenerate case).
+    /// For n < 2, returns a conservative large-variance diagonal matrix
+    /// (1e6 on diagonal) rather than identity, since "1 ns² variance"
+    /// would be arbitrarily small.
     pub fn finalize(&self) -> Matrix9 {
         if self.n < 2 {
-            return Matrix9::identity();
+            // Return conservative high-variance diagonal (not identity)
+            // This ensures MDE will be huge → priors dominated by min_effect_of_concern
+            return Matrix9::from_diagonal(&Vector9::repeat(1e6));
         }
 
         self.m2 / (self.n - 1) as f64
@@ -192,7 +198,7 @@ pub fn bootstrap_covariance_matrix(
     // Generate bootstrap replicates using online Welford covariance accumulation
     // This avoids allocating Vec<Vector9> (saves 72 KB for 1000 iterations)
     #[cfg(feature = "parallel")]
-    let cov_accumulator: WelfordCovariance9 = {
+    let cov_accumulator: WelfordCovariance9 = crate::thread_pool::install(|| {
         (0..n_bootstrap)
             .into_par_iter()
             .fold_with(
@@ -202,9 +208,9 @@ pub fn bootstrap_covariance_matrix(
                     vec![0.0; n],
                     WelfordCovariance9::new(),
                 ),
-                |(mut rng, mut buffer, mut acc), i| {
+                |(_, mut buffer, mut acc), i| {
                     // Counter-based RNG for deterministic, well-distributed seeding
-                    rng = Xoshiro256PlusPlus::seed_from_u64(counter_rng_seed(seed, i as u64));
+                    let mut rng = Xoshiro256PlusPlus::seed_from_u64(counter_rng_seed(seed, i as u64));
 
                     // Resample, compute deciles, and update accumulator
                     block_bootstrap_resample_into(data, block_size, &mut rng, &mut buffer);
@@ -222,7 +228,7 @@ pub fn bootstrap_covariance_matrix(
                     a
                 },
             )
-    };
+    });
 
     #[cfg(not(feature = "parallel"))]
     let cov_accumulator: WelfordCovariance9 = {
@@ -260,13 +266,155 @@ pub fn bootstrap_covariance_matrix(
     }
 }
 
+/// Estimate covariance matrix of quantile differences Δ* = q_F* - q_R* via joint block bootstrap.
+///
+/// Uses joint resampling to preserve temporal pairing between fixed and random samples.
+/// This captures cross-covariance Cov(q_F, q_R) > 0 from common-mode noise, giving the
+/// correct (smaller) Var(Δ) and improving statistical power.
+///
+/// # Arguments
+///
+/// * `interleaved` - Timing samples in measurement order, each tagged with class
+/// * `n_bootstrap` - Number of bootstrap replicates (typically 50-100)
+/// * `seed` - Random seed for reproducibility
+///
+/// # Returns
+///
+/// A `CovarianceEstimate` containing the covariance matrix of Δ* and diagnostics.
+///
+/// # Algorithm
+///
+/// 1. Compute block size as ceil(1.3 * n^(1/3))
+/// 2. For each bootstrap replicate:
+///    a. Block-resample the JOINT interleaved sequence (preserving temporal pairing)
+///    b. Split by class AFTER resampling
+///    c. Compute q_F* and q_R* from the split data
+///    d. Compute Δ* = q_F* - q_R*
+/// 3. Compute sample covariance of Δ* vectors
+/// 4. Add jitter to diagonal for numerical stability
+pub fn bootstrap_difference_covariance(
+    interleaved: &[crate::types::TimingSample],
+    n_bootstrap: usize,
+    seed: u64,
+) -> CovarianceEstimate {
+    use super::bootstrap::block_bootstrap_resample_joint_into;
+    use crate::types::Class;
+
+    let n = interleaved.len();
+    let block_size = compute_block_size(n);
+
+    // Generate bootstrap replicates of Δ* = q_F* - q_R* using joint resampling
+    #[cfg(feature = "parallel")]
+    let cov_accumulator: WelfordCovariance9 = crate::thread_pool::install(|| {
+        (0..n_bootstrap)
+            .into_par_iter()
+            .fold_with(
+                // Per-thread state: RNG, scratch buffer for joint samples, and Welford accumulator
+                (
+                    Xoshiro256PlusPlus::seed_from_u64(seed),
+                    vec![crate::types::TimingSample { time_ns: 0.0, class: Class::Baseline }; n],
+                    WelfordCovariance9::new(),
+                ),
+                |(_, mut buffer, mut acc), i| {
+                    // Counter-based RNG for deterministic, well-distributed seeding
+                    let mut rng = Xoshiro256PlusPlus::seed_from_u64(counter_rng_seed(seed, i as u64));
+
+                    // Joint resample the interleaved sequence (preserves temporal pairing)
+                    block_bootstrap_resample_joint_into(interleaved, block_size, &mut rng, &mut buffer);
+
+                    // Split by class AFTER resampling
+                    let mut baseline_samples: Vec<f64> = Vec::new();
+                    let mut sample_samples: Vec<f64> = Vec::new();
+                    for sample in &buffer {
+                        match sample.class {
+                            Class::Baseline => baseline_samples.push(sample.time_ns),
+                            Class::Sample => sample_samples.push(sample.time_ns),
+                        }
+                    }
+
+                    // Compute quantiles for each class
+                    let q_baseline = compute_deciles_inplace(&mut baseline_samples);
+                    let q_sample = compute_deciles_inplace(&mut sample_samples);
+
+                    // Compute difference and update accumulator
+                    let delta = q_baseline - q_sample;
+                    acc.update(&delta);
+
+                    (rng, buffer, acc)
+                },
+            )
+            .map(|(_, _, acc)| acc)
+            .reduce(
+                || WelfordCovariance9::new(),
+                |mut a, b| {
+                    a.merge(&b);
+                    a
+                },
+            )
+    });
+
+    #[cfg(not(feature = "parallel"))]
+    let cov_accumulator: WelfordCovariance9 = {
+        use crate::types::Class;
+
+        let mut accumulator = WelfordCovariance9::new();
+        let mut buffer = vec![crate::types::TimingSample { time_ns: 0.0, class: Class::Baseline }; n];
+
+        for i in 0..n_bootstrap {
+            // Counter-based RNG for deterministic, well-distributed seeding
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(counter_rng_seed(seed, i as u64));
+
+            // Joint resample the interleaved sequence (preserves temporal pairing)
+            block_bootstrap_resample_joint_into(interleaved, block_size, &mut rng, &mut buffer);
+
+            // Split by class AFTER resampling
+            let mut baseline_samples: Vec<f64> = Vec::new();
+            let mut sample_samples: Vec<f64> = Vec::new();
+            for sample in &buffer {
+                match sample.class {
+                    Class::Baseline => baseline_samples.push(sample.time_ns),
+                    Class::Sample => sample_samples.push(sample.time_ns),
+                }
+            }
+
+            // Compute quantiles for each class
+            let q_baseline = compute_deciles_inplace(&mut baseline_samples);
+            let q_sample = compute_deciles_inplace(&mut sample_samples);
+
+            // Compute difference and update accumulator
+            let delta = q_baseline - q_sample;
+            accumulator.update(&delta);
+        }
+        accumulator
+    };
+
+    // Finalize the Welford accumulator to get the covariance matrix
+    let cov_matrix = cov_accumulator.finalize();
+
+    // Add jitter for numerical stability
+    let (stabilized_matrix, jitter) = add_diagonal_jitter(cov_matrix);
+
+    // Compute minimum eigenvalue for stability check
+    let min_eigenvalue = estimate_min_eigenvalue(&stabilized_matrix);
+
+    CovarianceEstimate {
+        matrix: stabilized_matrix,
+        n_bootstrap,
+        block_size,
+        min_eigenvalue,
+        jitter_added: jitter,
+    }
+}
+
 /// Compute sample covariance matrix from a collection of vectors.
 ///
 /// Uses the unbiased estimator with n-1 denominator.
+/// For n < 2, returns conservative large-variance diagonal.
+#[cfg(test)]
 fn compute_sample_covariance(vectors: &[Vector9]) -> Matrix9 {
     let n = vectors.len();
     if n < 2 {
-        return Matrix9::identity();
+        return Matrix9::from_diagonal(&Vector9::repeat(1e6));
     }
 
     // Compute mean vector
@@ -304,6 +452,52 @@ fn add_diagonal_jitter(mut matrix: Matrix9) -> (Matrix9, f64) {
     }
 
     (matrix, jitter)
+}
+
+/// Apply variance floor based on timer resolution.
+///
+/// In idealized environments (simulators, deterministic operations), variance
+/// can approach zero, causing numerical instability. The 1/12 factor is the
+/// variance of a uniform distribution over one tick.
+///
+/// # Arguments
+///
+/// * `matrix` - Covariance matrix to apply floor to
+/// * `timer_resolution_ns` - Timer resolution in nanoseconds
+///
+/// # Returns
+///
+/// The matrix with variance floor applied to diagonal elements.
+pub fn apply_variance_floor(mut matrix: Matrix9, timer_resolution_ns: f64) -> Matrix9 {
+    let floor = timer_resolution_ns.powi(2) / 12.0;
+    for i in 0..9 {
+        matrix[(i, i)] += floor;
+    }
+    matrix
+}
+
+/// Scale covariance matrix from calibration to inference sample sizes.
+///
+/// Σ₀ was estimated from calibration set (n_cal samples) but will be used
+/// for inference set (n_inf samples). Quantile variance scales as 1/n,
+/// so we must adjust.
+///
+/// # Arguments
+///
+/// * `matrix` - Covariance matrix estimated from calibration set
+/// * `n_calibration` - Number of samples in calibration set
+/// * `n_inference` - Number of samples in inference set
+///
+/// # Returns
+///
+/// The scaled covariance matrix.
+pub fn scale_covariance_for_inference(
+    matrix: Matrix9,
+    n_calibration: usize,
+    n_inference: usize,
+) -> Matrix9 {
+    let scale = n_calibration as f64 / n_inference as f64;
+    matrix * scale
 }
 
 /// Estimate minimum eigenvalue of a matrix.
@@ -425,16 +619,17 @@ mod tests {
 
     #[test]
     fn test_welford_edge_cases() {
-        // n=0 should return identity
+        // n=0 should return conservative high-variance diagonal
         let empty = WelfordCovariance9::new();
         let cov0 = empty.finalize();
-        assert_eq!(cov0, Matrix9::identity(), "n=0 should return identity");
+        let expected_conservative = Matrix9::from_diagonal(&Vector9::repeat(1e6));
+        assert_eq!(cov0, expected_conservative, "n=0 should return conservative diagonal");
 
-        // n=1 should return identity
+        // n=1 should return conservative high-variance diagonal
         let mut one = WelfordCovariance9::new();
         one.update(&Vector9::from_element(42.0));
         let cov1 = one.finalize();
-        assert_eq!(cov1, Matrix9::identity(), "n=1 should return identity");
+        assert_eq!(cov1, expected_conservative, "n=1 should return conservative diagonal");
 
         // n=2 should compute valid covariance
         let mut two = WelfordCovariance9::new();
@@ -442,9 +637,8 @@ mod tests {
         two.update(&Vector9::from_element(2.0));
         let cov2 = two.finalize();
 
-        // Should not be identity (has variance)
-        let is_identity = cov2 == Matrix9::identity();
-        assert!(!is_identity, "n=2 should not return identity");
+        // Should not be the conservative fallback (has actual variance)
+        assert!(cov2 != expected_conservative, "n=2 should not return conservative fallback");
 
         // Should be symmetric
         for i in 0..9 {

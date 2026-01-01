@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{compute_bayes_factor, estimate_mde, run_ci_gate, CiGateInput};
-use crate::statistics::{bootstrap_covariance_matrix, compute_deciles};
-use crate::types::Vector9;
+use crate::statistics::{bootstrap_difference_covariance, compute_deciles};
+use crate::types::{Class, TimingSample, Vector9};
 
 /// Warning from the sanity check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,11 +117,21 @@ fn compute_full_leak_check(first: &[f64], second: &[f64], timer_resolution_ns: f
     let q_second = compute_deciles(second);
     let delta: Vector9 = q_first - q_second;
 
-    let cov_first = bootstrap_covariance_matrix(first, SANITY_BOOTSTRAP, 123);
-    let cov_second = bootstrap_covariance_matrix(second, SANITY_BOOTSTRAP, 456);
-    let sigma0 = cov_first.matrix + cov_second.matrix;
+    // Create interleaved sequence for joint resampling
+    // Treat first half as "Fixed", second half as "Random" for the comparison
+    let min_len = first.len().min(second.len());
+    let mut interleaved = Vec::with_capacity(min_len * 2);
+    for i in 0..min_len {
+        interleaved.push(TimingSample { time_ns: first[i], class: Class::Baseline });
+        interleaved.push(TimingSample { time_ns: second[i], class: Class::Sample });
+    }
 
-    let mde = estimate_mde(&sigma0, 200, (1e6, 1e6));
+    // Bootstrap Δ* = q_F* - q_R* via joint resampling
+    let cov_estimate = bootstrap_difference_covariance(&interleaved, SANITY_BOOTSTRAP, 123);
+    let sigma0 = cov_estimate.matrix;
+
+    // Default α=0.01 for MDE in sanity check
+    let mde = estimate_mde(&sigma0, 0.01);
     let min_effect = 10.0;
     let prior_sigmas = (
         (2.0 * mde.shift_ns).max(min_effect),
@@ -130,12 +140,13 @@ fn compute_full_leak_check(first: &[f64], second: &[f64], timer_resolution_ns: f
 
     let ci_gate_input = CiGateInput {
         observed_diff: delta,
-        fixed_samples: first,
-        random_samples: second,
+        baseline_samples: first,
+        sample_samples: second,
         alpha: SANITY_ALPHA,
         bootstrap_iterations: SANITY_BOOTSTRAP,
         seed: Some(999),
         timer_resolution_ns,
+        min_effect_of_concern: 0.0, // Sanity checks should detect any harness issues
     };
     let ci_gate = run_ci_gate(&ci_gate_input);
 

@@ -1,16 +1,23 @@
 //! End-to-end integration tests.
 
-use timing_oracle::TimingOracle;
+use timing_oracle::{helpers::InputPair, timing_test_checked, Outcome, TimingOracle};
 
 /// Basic smoke test that the API works.
 #[test]
 fn smoke_test() {
-    let result = TimingOracle::new()
+    let inputs = InputPair::new(|| 1u32, || 2u32);
+    let outcome = TimingOracle::new()
         .samples(100) // Minimal for speed
         .warmup(10)
-        .test(|| std::hint::black_box(1 + 1), || std::hint::black_box(2 + 2));
+        .test(inputs, |x| {
+            std::hint::black_box(x + 1);
+        });
 
     // Just verify we get a result without panicking
+    let result = match outcome {
+        Outcome::Completed(r) => r,
+        Outcome::Unmeasurable { .. } => return, // Skip if unmeasurable
+    };
     assert!(result.leak_probability >= 0.0);
     assert!(result.leak_probability <= 1.0);
 }
@@ -35,13 +42,35 @@ fn builder_api() {
 /// Test convenience function.
 #[test]
 fn convenience_function() {
-    let result = TimingOracle::new()
-        .samples(200)
-        .test(
-            || std::hint::black_box(42),
-            || std::hint::black_box(42),
-        );
+    let inputs = InputPair::new(|| 42u32, || 42u32);
+    let outcome = TimingOracle::new().samples(200).test(inputs, |x| {
+        std::hint::black_box(*x);
+    });
 
+    let result = match outcome {
+        Outcome::Completed(r) => r,
+        Outcome::Unmeasurable { .. } => return,
+    };
+    assert!(result.leak_probability >= 0.0);
+    assert!(result.leak_probability <= 1.0);
+}
+
+/// Test macro API.
+#[test]
+fn macro_api() {
+    let outcome = timing_test_checked! {
+        oracle: TimingOracle::new().samples(100),
+        baseline: || 42u32,
+        sample: || rand::random::<u32>(),
+        measure: |x| {
+            std::hint::black_box(*x);
+        },
+    };
+
+    let result = match outcome {
+        Outcome::Completed(r) => r,
+        Outcome::Unmeasurable { .. } => return,
+    };
     assert!(result.leak_probability >= 0.0);
     assert!(result.leak_probability <= 1.0);
 }
@@ -49,9 +78,13 @@ fn convenience_function() {
 /// Test result serialization.
 #[test]
 fn result_serialization() {
-    let result = TimingOracle::new()
-        .samples(100)
-        .test(|| (), || ());
+    let inputs = InputPair::new(|| (), || ());
+    let outcome = TimingOracle::new().samples(100).test(inputs, |_| {});
+
+    let result = match outcome {
+        Outcome::Completed(r) => r,
+        Outcome::Unmeasurable { .. } => return,
+    };
 
     // Verify it can be serialized to JSON
     let json = serde_json::to_string(&result).expect("Should serialize");

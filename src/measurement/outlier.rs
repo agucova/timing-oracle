@@ -21,6 +21,14 @@ pub struct OutlierStats {
     pub outlier_fraction: f64,
     /// The threshold value used for filtering.
     pub threshold: u64,
+    /// Total samples in fixed class before filtering.
+    pub total_fixed: usize,
+    /// Outliers removed from fixed class.
+    pub trimmed_fixed: usize,
+    /// Total samples in random class before filtering.
+    pub total_random: usize,
+    /// Outliers removed from random class.
+    pub trimmed_random: usize,
 }
 
 impl OutlierStats {
@@ -32,6 +40,28 @@ impl OutlierStats {
             outliers_removed: 0,
             outlier_fraction: 0.0,
             threshold: u64::MAX,
+            total_fixed: total_samples / 2,
+            trimmed_fixed: 0,
+            total_random: total_samples / 2,
+            trimmed_random: 0,
+        }
+    }
+
+    /// Outlier rate for fixed class.
+    pub fn rate_fixed(&self) -> f64 {
+        if self.total_fixed == 0 {
+            0.0
+        } else {
+            self.trimmed_fixed as f64 / self.total_fixed as f64
+        }
+    }
+
+    /// Outlier rate for random class.
+    pub fn rate_random(&self) -> f64 {
+        if self.total_random == 0 {
+            0.0
+        } else {
+            self.trimmed_random as f64 / self.total_random as f64
         }
     }
 }
@@ -68,7 +98,17 @@ pub fn filter_outliers(
         return (
             fixed.to_vec(),
             random.to_vec(),
-            OutlierStats::no_filtering(total_samples),
+            OutlierStats {
+                total_samples,
+                retained_samples: total_samples,
+                outliers_removed: 0,
+                outlier_fraction: 0.0,
+                threshold: u64::MAX,
+                total_fixed: fixed.len(),
+                trimmed_fixed: 0,
+                total_random: random.len(),
+                trimmed_random: 0,
+            },
         );
     }
 
@@ -86,6 +126,8 @@ pub fn filter_outliers(
 
     let retained = filtered_fixed.len() + filtered_random.len();
     let removed = total_samples - retained;
+    let trimmed_fixed = fixed.len() - filtered_fixed.len();
+    let trimmed_random = random.len() - filtered_random.len();
 
     let stats = OutlierStats {
         total_samples,
@@ -93,6 +135,10 @@ pub fn filter_outliers(
         outliers_removed: removed,
         outlier_fraction: removed as f64 / total_samples as f64,
         threshold,
+        total_fixed: fixed.len(),
+        trimmed_fixed,
+        total_random: random.len(),
+        trimmed_random,
     };
 
     (filtered_fixed, filtered_random, stats)

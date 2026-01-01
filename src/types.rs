@@ -20,8 +20,20 @@ pub type Vector2 = SVector<f64, 2>;
 /// Input class identifier for timing measurements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Class {
-    /// Fixed input that might trigger timing variations.
-    Fixed,
-    /// Randomly sampled input for comparison.
-    Random,
+    /// Baseline input (typically constant) that establishes the reference timing.
+    Baseline,
+    /// Sample input (typically varied) for comparison against baseline.
+    Sample,
+}
+
+/// A timing sample with its class label, preserving measurement order.
+///
+/// Used for joint resampling in covariance estimation, which preserves
+/// temporal pairing between baseline and sample measurements.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingSample {
+    /// Timing value in nanoseconds.
+    pub time_ns: f64,
+    /// Which class this sample belongs to.
+    pub class: Class,
 }

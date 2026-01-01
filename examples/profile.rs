@@ -3,7 +3,7 @@
 //! Run with: cargo run --release --features parallel --example profile
 
 use std::time::Instant;
-use timing_oracle::TimingOracle;
+use timing_oracle::{helpers::InputPair, TimingOracle};
 
 fn early_exit_compare(a: &[u8], b: &[u8]) -> bool {
     for i in 0..a.len().min(b.len()) {
@@ -14,8 +14,15 @@ fn early_exit_compare(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len()
 }
 
+fn rand_bytes_512() -> [u8; 512] {
+    let mut arr = [0u8; 512];
+    for byte in &mut arr {
+        *byte = rand::random();
+    }
+    arr
+}
+
 fn main() {
-    let timer = timing_oracle::Timer::new();
     let secret = [0u8; 512];
 
     println!("=== Timing Oracle Performance Profiling ===\n");
@@ -23,23 +30,14 @@ fn main() {
     // Test 1: Balanced preset (20k samples)
     println!("Test 1: Balanced preset (20k samples, 100 CI bootstrap, 50 cov bootstrap)");
     let start = Instant::now();
-    let result = TimingOracle::balanced()
-        .with_timer(timer.clone())
-        .test(
-            || {
-                let input = [0u8; 512];
-                std::hint::black_box(early_exit_compare(&secret, &input));
-            },
-            || {
-                let mut input = [0u8; 512];
-                for i in 0..512 {
-                    input[i] = rand::random();
-                }
-                std::hint::black_box(early_exit_compare(&secret, &input));
-            },
-        );
+    let inputs = InputPair::new(|| [0u8; 512], rand_bytes_512);
+    let outcome = TimingOracle::balanced()
+        .test(inputs, |input| {
+            std::hint::black_box(early_exit_compare(&secret, input));
+        });
     let balanced_time = start.elapsed();
 
+    let result = outcome.unwrap_completed();
     println!("  Total time: {:.2}s", balanced_time.as_secs_f64());
     println!("  Leak probability: {:.3}", result.leak_probability);
     println!("  Samples per class: {}", result.metadata.samples_per_class);
@@ -48,23 +46,14 @@ fn main() {
     // Test 2: Quick preset (5k samples)
     println!("Test 2: Quick preset (5k samples, 50 CI bootstrap, 50 cov bootstrap)");
     let start = Instant::now();
-    let result = TimingOracle::quick()
-        .with_timer(timer.clone())
-        .test(
-            || {
-                let input = [0u8; 512];
-                std::hint::black_box(early_exit_compare(&secret, &input));
-            },
-            || {
-                let mut input = [0u8; 512];
-                for i in 0..512 {
-                    input[i] = rand::random();
-                }
-                std::hint::black_box(early_exit_compare(&secret, &input));
-            },
-        );
+    let inputs = InputPair::new(|| [0u8; 512], rand_bytes_512);
+    let outcome = TimingOracle::quick()
+        .test(inputs, |input| {
+            std::hint::black_box(early_exit_compare(&secret, input));
+        });
     let quick_time = start.elapsed();
 
+    let result = outcome.unwrap_completed();
     println!("  Total time: {:.2}s", quick_time.as_secs_f64());
     println!("  Leak probability: {:.3}", result.leak_probability);
     println!("  Samples per class: {}", result.metadata.samples_per_class);
@@ -73,23 +62,14 @@ fn main() {
     // Test 3: Default preset (100k samples)
     println!("Test 3: Default preset (100k samples, 100 CI bootstrap, 50 cov bootstrap)");
     let start = Instant::now();
-    let result = TimingOracle::new()
-        .with_timer(timer.clone())
-        .test(
-            || {
-                let input = [0u8; 512];
-                std::hint::black_box(early_exit_compare(&secret, &input));
-            },
-            || {
-                let mut input = [0u8; 512];
-                for i in 0..512 {
-                    input[i] = rand::random();
-                }
-                std::hint::black_box(early_exit_compare(&secret, &input));
-            },
-        );
+    let inputs = InputPair::new(|| [0u8; 512], rand_bytes_512);
+    let outcome = TimingOracle::new()
+        .test(inputs, |input| {
+            std::hint::black_box(early_exit_compare(&secret, input));
+        });
     let default_time = start.elapsed();
 
+    let result = outcome.unwrap_completed();
     println!("  Total time: {:.2}s", default_time.as_secs_f64());
     println!("  Leak probability: {:.3}", result.leak_probability);
     println!("  Samples per class: {}", result.metadata.samples_per_class);

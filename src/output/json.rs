@@ -55,13 +55,14 @@ pub fn to_json_pretty(result: &TestResult) -> Result<String, serde_json::Error> 
 mod tests {
     use super::*;
     use crate::result::{
-        CiGate, Effect, EffectPattern, Exploitability, MeasurementQuality, Metadata,
+        CiGate, Diagnostics, Effect, EffectPattern, Exploitability, MeasurementQuality, Metadata,
         MinDetectableEffect,
     };
 
     fn make_test_result() -> TestResult {
         TestResult {
             leak_probability: 0.85,
+            bayes_factor: 5.67, // Moderate evidence for leak
             effect: Some(Effect {
                 shift_ns: 150.0,
                 tail_ns: 25.0,
@@ -76,11 +77,13 @@ mod tests {
             ci_gate: CiGate {
                 alpha: 0.001,
                 passed: false,
-                thresholds: [0.0; 9],
+                threshold: 0.0,
+                max_observed: 0.0,
                 observed: [0.0; 9],
             },
             quality: MeasurementQuality::Good,
             outlier_fraction: 0.02,
+            diagnostics: Diagnostics::all_ok(),
             metadata: Metadata {
                 samples_per_class: 10000,
                 cycles_per_ns: 3.0,

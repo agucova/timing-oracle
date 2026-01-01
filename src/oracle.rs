@@ -6,17 +6,23 @@ use std::time::Instant;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
-use crate::analysis::{compute_bayes_factor, decompose_effect, estimate_mde, run_ci_gate, CiGateInput};
+use std::hash::Hash;
+
+use crate::analysis::{compute_bayes_factor, compute_diagnostics, decompose_effect, estimate_mde, run_ci_gate, CiGateInput};
 use crate::ci::CiTestBuilder;
 use crate::config::Config;
-use crate::measurement::{filter_outliers, Collector, Timer};
+use crate::helpers::InputPair;
+use crate::measurement::{filter_outliers, BoxedTimer, TimerSpec};
 use crate::preflight::run_all_checks;
 use crate::result::{
-    BatchingInfo, CiGate, Effect, Exploitability, MeasurementQuality, Metadata, MinDetectableEffect,
-    TestResult,
+    BatchingInfo, CiGate, Diagnostics, Effect, Exploitability, MeasurementQuality, Metadata, MinDetectableEffect,
+    Outcome, TestResult,
 };
-use crate::statistics::{bootstrap_covariance_matrix, compute_deciles_fast};
-use crate::types::Vector9;
+use crate::statistics::{
+    apply_variance_floor, bootstrap_difference_covariance, compute_deciles_fast,
+    scale_covariance_for_inference,
+};
+use crate::types::{Class, Vector9};
 
 /// Main entry point for timing analysis.
 ///
@@ -25,29 +31,49 @@ use crate::types::Vector9;
 /// # Example
 ///
 /// ```ignore
-/// use timing_oracle::TimingOracle;
+/// use timing_oracle::{TimingOracle, helpers::InputPair};
+///
+/// let inputs = InputPair::new(
+///     || [0u8; 32],          // baseline: returns constant value
+///     || rand::random(),     // sample: generates varied values
+/// );
 ///
 /// let result = TimingOracle::new()
 ///     .samples(50_000)
 ///     .ci_alpha(0.001)
-///     .test(
-///         || my_function(&fixed_input),
-///         || my_function(&random_input()),
-///     );
+///     .test(inputs, |data| my_function(data));
+/// ```
+///
+/// # Automatic PMU Detection
+///
+/// When running with sudo/root privileges, the library automatically uses
+/// cycle-accurate PMU timing (kperf on macOS, perf_event on Linux).
+/// No code changes needed - just run with sudo.
+///
+/// To explicitly control timer selection:
+///
+/// ```ignore
+/// use timing_oracle::{TimingOracle, TimerSpec};
+///
+/// // Force standard timer (no PMU attempt)
+/// let result = TimingOracle::new()
+///     .timer_spec(TimerSpec::Standard)
+///     .test(...);
 /// ```
 #[derive(Debug, Clone)]
 pub struct TimingOracle {
     config: Config,
-    /// Optional pre-calibrated timer to avoid repeated calibration overhead.
-    timer: Option<Timer>,
+    /// Timer specification (Auto by default - tries PMU first).
+    timer_spec: TimerSpec,
 }
 
 struct PipelineInputs {
-    fixed_cycles: Vec<u64>,
-    random_cycles: Vec<u64>,
+    baseline_cycles: Vec<u64>,
+    sample_cycles: Vec<u64>,
     interleaved_cycles: Vec<u64>,
-    fixed_gen_time_ns: Option<f64>,
-    random_gen_time_ns: Option<f64>,
+    interleaved_classes: Vec<Class>,
+    baseline_gen_time_ns: Option<f64>,
+    sample_gen_time_ns: Option<f64>,
     batching: BatchingInfo,
 }
 
@@ -59,10 +85,13 @@ impl Default for TimingOracle {
 
 impl TimingOracle {
     /// Create with default configuration.
+    ///
+    /// Uses `TimerSpec::Auto` which automatically detects and uses PMU timing
+    /// (kperf/perf_event) when running with sufficient privileges.
     pub fn new() -> Self {
         Self {
             config: Config::default(),
-            timer: None,
+            timer_spec: TimerSpec::Auto,
         }
     }
 
@@ -85,7 +114,7 @@ impl TimingOracle {
                 ci_bootstrap_iterations: 50,
                 ..Config::default()
             },
-            timer: None,
+            timer_spec: TimerSpec::Auto,
         }
     }
 
@@ -108,7 +137,7 @@ impl TimingOracle {
                 ci_bootstrap_iterations: 100,
                 ..Config::default()
             },
-            timer: None,
+            timer_spec: TimerSpec::Auto,
         }
     }
 
@@ -131,7 +160,7 @@ impl TimingOracle {
                 ci_bootstrap_iterations: 30,
                 ..Config::default()
             },
-            timer: None,
+            timer_spec: TimerSpec::Auto,
         }
     }
 
@@ -140,30 +169,40 @@ impl TimingOracle {
         CiTestBuilder::from_oracle(Self::new())
     }
 
-    /// Use a pre-calibrated timer to avoid calibration overhead.
+    /// Set the timer specification.
     ///
-    /// Timer calibration (`cycles_per_ns()`) takes ~50ms. When running
-    /// many trials (e.g., in calibration tests), reusing a single timer
-    /// can significantly speed up execution.
+    /// Controls which timer implementation is used:
+    /// - `TimerSpec::Auto` (default): Try PMU first, fall back to standard
+    /// - `TimerSpec::Standard`: Always use standard timer (rdtsc/cntvct_el0)
+    /// - `TimerSpec::PreferPmu`: Prefer PMU, fall back if unavailable
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use timing_oracle::{TimingOracle, Timer};
+    /// use timing_oracle::{TimingOracle, TimerSpec};
     ///
-    /// // Calibrate once
-    /// let timer = Timer::new();
-    ///
-    /// // Reuse across many trials
-    /// for _ in 0..100 {
-    ///     let result = TimingOracle::quick()
-    ///         .with_timer(timer.clone())
-    ///         .test(|| fixed_op(), || random_op());
-    /// }
+    /// // Force standard timer (no PMU attempt)
+    /// let result = TimingOracle::new()
+    ///     .timer_spec(TimerSpec::Standard)
+    ///     .test(...);
     /// ```
-    pub fn with_timer(mut self, timer: Timer) -> Self {
-        self.timer = Some(timer);
+    pub fn timer_spec(mut self, spec: TimerSpec) -> Self {
+        self.timer_spec = spec;
         self
+    }
+
+    /// Use the standard timer only (no PMU attempt).
+    ///
+    /// Shorthand for `.timer_spec(TimerSpec::Standard)`.
+    pub fn standard_timer(self) -> Self {
+        self.timer_spec(TimerSpec::Standard)
+    }
+
+    /// Prefer PMU timer with fallback to standard.
+    ///
+    /// Shorthand for `.timer_spec(TimerSpec::PreferPmu)`.
+    pub fn prefer_pmu(self) -> Self {
+        self.timer_spec(TimerSpec::PreferPmu)
     }
 
     /// Set samples per class.
@@ -251,72 +290,196 @@ impl TimingOracle {
         &self.config
     }
 
-    /// Run test with simple closures.
+    /// Run a timing test with pre-generated inputs.
     ///
-    /// # ⚠️ Critical Requirement
+    /// This is the primary API for timing tests. It handles input pre-generation
+    /// internally to ensure accurate measurements without generator overhead.
     ///
-    /// Both closures must execute **identical operations** - only the input data should differ.
-    /// Never call RNG functions, allocate memory, or perform I/O inside the closures.
+    /// # Example
     ///
     /// ```ignore
-    /// // ❌ WRONG
-    /// TimingOracle::new().test(|| op(&FIXED), || op(&rand::random()));  // RNG overhead!
+    /// use timing_oracle::{TimingOracle, helpers::InputPair};
     ///
-    /// // ✅ CORRECT
-    /// use timing_oracle::helpers::InputPair;
-    /// let inputs = InputPair::new(FIXED, || rand::random());
-    /// TimingOracle::new().test(|| op(&inputs.fixed()), || op(&inputs.random()));
+    /// let inputs = InputPair::new([0u8; 32], || rand::random());
+    /// let result = TimingOracle::new().test(inputs, |data| {
+    ///     my_crypto_function(data);
+    /// });
     /// ```
     ///
-    /// See `helpers::InputPair` for utilities to pre-generate inputs correctly.
+    /// # How It Works
+    ///
+    /// 1. Pre-generates all baseline and sample inputs before measurement
+    /// 2. Runs warmup iterations
+    /// 3. Measures the operation with randomized interleaving
+    /// 4. Only the `operation` closure is timed (not input generation)
     ///
     /// # Arguments
     ///
-    /// * `fixed` - Closure that executes the operation with a fixed input
-    /// * `random` - Closure that executes the operation with random inputs
+    /// * `inputs` - An `InputPair` containing the baseline and sample generators
+    /// * `operation` - Closure that performs the operation under test
     ///
     /// # Returns
     ///
-    /// A `TestResult` containing the analysis results.
-    pub fn test<F, R, T>(self, mut fixed: F, mut random: R) -> TestResult
+    /// An `Outcome` which is either `Completed(TestResult)` or `Unmeasurable` if
+    /// the operation is too fast to measure reliably.
+    pub fn test<T, F1, F2, F>(self, inputs: InputPair<T, F1, F2>, mut operation: F) -> Outcome
     where
-        F: FnMut() -> T,
-        R: FnMut() -> T,
+        T: Clone + Hash,
+        F1: FnMut() -> T,
+        F2: FnMut() -> T,
+        F: FnMut(&T),
     {
         let start_time = Instant::now();
+        let mut rng = rand::rng();
 
-        // Step 1: Create timer (reuse if provided) and collector
-        let timer = self.timer.clone().unwrap_or_default();
-        let collector = Collector::with_timer(timer.clone(), self.config.warmup);
+        // Step 1: Create timer based on spec (auto-detects PMU if available)
+        let mut timer = self.timer_spec.create_timer();
 
-        // Step 2: Collect timing samples with randomized interleaving
-        let (samples, batching) =
-            collector.collect_with_info(self.config.samples, &mut fixed, &mut random);
-        let mut fixed_cycles = Vec::with_capacity(self.config.samples);
-        let mut random_cycles = Vec::with_capacity(self.config.samples);
+        // Step 2: Pre-generate ALL inputs before measurement (critical for accuracy)
+        let baseline_gen_start = Instant::now();
+        let baseline_inputs: Vec<T> = (0..self.config.samples)
+            .map(|_| inputs.baseline())
+            .collect();
+        let baseline_gen_time_ns = baseline_gen_start.elapsed().as_nanos() as f64 / self.config.samples as f64;
+
+        let sample_gen_start = Instant::now();
+        let sample_inputs: Vec<T> = (0..self.config.samples)
+            .map(|_| {
+                let value = inputs.generate_sample();
+                // Track for anomaly detection during pre-generation
+                inputs.track_value(&value);
+                value
+            })
+            .collect();
+        let sample_gen_time_ns = sample_gen_start.elapsed().as_nanos() as f64 / self.config.samples as f64;
+
+        // Note: With InputPair API, inputs are pre-generated BEFORE measurement,
+        // so generator overhead does not affect timing results. The spec's 10% abort
+        // threshold (§3.2) was for the old API where generators could run inside the
+        // timed region. With InputPair, this is a non-issue by design.
+
+        // Step 4: Warmup
+        for i in 0..self.config.warmup.min(self.config.samples) {
+            std::hint::black_box(operation(&baseline_inputs[i % baseline_inputs.len()]));
+            std::hint::black_box(operation(&sample_inputs[i % sample_inputs.len()]));
+        }
+
+        // Step 5: Pilot phase to check measurability
+        const PILOT_SAMPLES: usize = 50;
+        let mut pilot_cycles = Vec::with_capacity(PILOT_SAMPLES * 2);
+
+        for i in 0..PILOT_SAMPLES.min(self.config.samples) {
+            let cycles = timer.measure_cycles(|| {
+                std::hint::black_box(operation(&baseline_inputs[i]));
+            });
+            pilot_cycles.push(cycles);
+
+            let cycles = timer.measure_cycles(|| {
+                std::hint::black_box(operation(&sample_inputs[i]));
+            });
+            pilot_cycles.push(cycles);
+        }
+
+        // Check if operation is measurable
+        pilot_cycles.sort_unstable();
+        let median_cycles = pilot_cycles[pilot_cycles.len() / 2];
+        let median_ns = timer.cycles_to_ns(median_cycles);
+        let resolution_ns = timer.resolution_ns();
+        let ticks_per_call = median_ns / resolution_ns;
+
+        if ticks_per_call < crate::measurement::MIN_TICKS_SINGLE_CALL {
+            let threshold_ns = resolution_ns * crate::measurement::MIN_TICKS_SINGLE_CALL;
+
+            // Return early for unmeasurable operations
+            let platform = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                "Apple Silicon (cntvct_el0, ~42ns resolution)"
+            } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                "ARM64 Linux (cntvct_el0, ~40ns resolution)"
+            } else if cfg!(target_arch = "x86_64") {
+                "x86_64 (rdtsc, ~1ns resolution)"
+            } else {
+                "Unknown platform"
+            };
+
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let recommendation = "Run with sudo to enable kperf cycle counting (~1ns resolution), or increase operation complexity";
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let recommendation = "Run with sudo and --features perf for cycle-accurate timing, or increase operation complexity";
+            #[cfg(not(target_arch = "aarch64"))]
+            let recommendation = "Increase operation complexity (current operation is too fast to measure reliably)";
+
+            return Outcome::Unmeasurable {
+                operation_ns: median_ns,
+                threshold_ns,
+                platform: platform.to_string(),
+                recommendation: recommendation.to_string(),
+            };
+        }
+
+        let batching = crate::result::BatchingInfo {
+            enabled: false,
+            k: 1,
+            ticks_per_batch: ticks_per_call,
+            rationale: format!("Pre-generated inputs ({:.1} ticks/call)", ticks_per_call),
+            unmeasurable: None,
+        };
+
+        // Step 6: Create randomized schedule (interleaves baseline and sample measurements)
+        let mut schedule: Vec<(Class, usize)> = Vec::with_capacity(self.config.samples * 2);
+        for i in 0..self.config.samples {
+            schedule.push((Class::Baseline, i));
+            schedule.push((Class::Sample, i));
+        }
+        schedule.shuffle(&mut rng);
+
+        // Step 7: Collect timing samples (only operation is timed)
+        let mut baseline_cycles = Vec::with_capacity(self.config.samples);
+        let mut sample_cycles = Vec::with_capacity(self.config.samples);
         let mut interleaved_cycles = Vec::with_capacity(self.config.samples * 2);
+        let mut interleaved_classes = Vec::with_capacity(self.config.samples * 2);
 
-        for sample in samples {
-            interleaved_cycles.push(sample.cycles);
-            match sample.class {
-                crate::types::Class::Fixed => fixed_cycles.push(sample.cycles),
-                crate::types::Class::Random => random_cycles.push(sample.cycles),
+        for (class, idx) in schedule {
+            match class {
+                Class::Baseline => {
+                    let cycles = timer.measure_cycles(|| {
+                        std::hint::black_box(operation(&baseline_inputs[idx]));
+                    });
+                    baseline_cycles.push(cycles);
+                    interleaved_cycles.push(cycles);
+                    interleaved_classes.push(Class::Baseline);
+                }
+                Class::Sample => {
+                    let cycles = timer.measure_cycles(|| {
+                        std::hint::black_box(operation(&sample_inputs[idx]));
+                    });
+                    sample_cycles.push(cycles);
+                    interleaved_cycles.push(cycles);
+                    interleaved_classes.push(Class::Sample);
+                }
             }
         }
 
-        // Run the analysis pipeline
-        self.run_pipeline(
+        // Step 8: Check for anomalies after measurement
+        if let Some(warning) = inputs.check_anomaly() {
+            eprintln!("[timing-oracle] {}", warning);
+        }
+
+        // Step 9: Run analysis pipeline
+        let result = self.run_pipeline(
             PipelineInputs {
-                fixed_cycles,
-                random_cycles,
+                baseline_cycles,
+                sample_cycles,
                 interleaved_cycles,
-                fixed_gen_time_ns: None,
-                random_gen_time_ns: None,
+                interleaved_classes,
+                baseline_gen_time_ns: Some(baseline_gen_time_ns),
+                sample_gen_time_ns: Some(sample_gen_time_ns),
                 batching,
             },
             &timer,
             start_time,
-        )
+        );
+
+        Outcome::Completed(result)
     }
 
     /// Run test with setup and state.
@@ -327,25 +490,25 @@ impl TimingOracle {
     ///
     /// * `S` - State type created by setup
     /// * `I` - Input type produced by generators
-    /// * `F` - Fixed input generator
-    /// * `R` - Random input generator
+    /// * `B` - Baseline input generator
+    /// * `R` - Sample input generator
     /// * `E` - Executor that runs the operation under test
     ///
     /// # Arguments
     ///
     /// * `setup` - Creates initial state (called once)
-    /// * `fixed_input` - Generates the fixed input
-    /// * `random_input` - Generates random inputs
+    /// * `baseline_input` - Generates the baseline input
+    /// * `sample_input` - Generates sample inputs
     /// * `execute` - Runs the operation under test with given input
-    pub fn test_with_state<S, F, R, I, E>(
+    pub fn test_with_state<S, B, R, I, E>(
         self,
         setup: impl FnOnce() -> S,
-        mut fixed_input: F,
-        mut random_input: R,
+        mut baseline_input: B,
+        mut sample_input: R,
         mut execute: E,
-    ) -> TestResult
+    ) -> crate::result::Outcome
     where
-        F: FnMut(&mut S) -> I,
+        B: FnMut(&mut S) -> I,
         R: FnMut(&mut S, &mut rand::rngs::ThreadRng) -> I,
         E: FnMut(&mut S, I),
         I: Clone,
@@ -354,24 +517,24 @@ impl TimingOracle {
         self.test_with_state_rng(
             setup,
             &mut rng,
-            &mut fixed_input,
-            &mut random_input,
+            &mut baseline_input,
+            &mut sample_input,
             &mut execute,
         )
     }
 
     /// Run test with setup and state, using a caller-provided RNG.
-    pub fn test_with_state_rng<S, F, R, I, E, RNG>(
+    pub fn test_with_state_rng<S, B, R, I, E, RNG>(
         self,
         setup: impl FnOnce() -> S,
         rng: &mut RNG,
-        fixed_input: &mut F,
-        random_input: &mut R,
+        baseline_input: &mut B,
+        sample_input: &mut R,
         execute: &mut E,
-    ) -> TestResult
+    ) -> crate::result::Outcome
     where
         RNG: rand::Rng + ?Sized,
-        F: FnMut(&mut S) -> I,
+        B: FnMut(&mut S) -> I,
         R: FnMut(&mut S, &mut RNG) -> I,
         E: FnMut(&mut S, I),
         I: Clone,
@@ -381,121 +544,217 @@ impl TimingOracle {
         // Create state
         let mut state = setup();
 
-        // Create timer (reuse if provided)
-        let timer = self.timer.clone().unwrap_or_default();
+        // Create timer based on spec (auto-detects PMU if available)
+        let mut timer = self.timer_spec.create_timer();
 
         // Pre-generate all inputs to avoid borrow conflicts
-        let fixed_gen_start = Instant::now();
-        let fixed_inputs: Vec<I> = (0..self.config.samples)
-            .map(|_| fixed_input(&mut state))
+        let baseline_gen_start = Instant::now();
+        let baseline_inputs: Vec<I> = (0..self.config.samples)
+            .map(|_| baseline_input(&mut state))
             .collect();
-        let fixed_gen_time_ns = if self.config.samples > 0 {
-            fixed_gen_start.elapsed().as_nanos() as f64 / self.config.samples as f64
+        let baseline_gen_time_ns = if self.config.samples > 0 {
+            baseline_gen_start.elapsed().as_nanos() as f64 / self.config.samples as f64
         } else {
             0.0
         };
 
-        let random_gen_start = Instant::now();
-        let random_inputs: Vec<I> = (0..self.config.samples)
-            .map(|_| random_input(&mut state, rng))
+        let sample_gen_start = Instant::now();
+        let sample_inputs: Vec<I> = (0..self.config.samples)
+            .map(|_| sample_input(&mut state, rng))
             .collect();
-        let random_gen_time_ns = if self.config.samples > 0 {
-            random_gen_start.elapsed().as_nanos() as f64 / self.config.samples as f64
+        let sample_gen_time_ns = if self.config.samples > 0 {
+            sample_gen_start.elapsed().as_nanos() as f64 / self.config.samples as f64
         } else {
             0.0
         };
 
         // Run warmup
         for _ in 0..self.config.warmup {
-            if let Some(input) = fixed_inputs.first() {
+            if let Some(input) = baseline_inputs.first() {
                 execute(&mut state, input.clone());
             }
-            if let Some(input) = random_inputs.first() {
+            if let Some(input) = sample_inputs.first() {
                 execute(&mut state, input.clone());
             }
         }
 
-        // Create randomized schedule
+        // Pilot phase: check measurability
+        // Run a small sample to verify the operation is measurable
+        const PILOT_SAMPLES: usize = 50;
+        let mut pilot_cycles = Vec::with_capacity(PILOT_SAMPLES * 2);
+
+        for i in 0..PILOT_SAMPLES.min(self.config.samples) {
+            let cycles = timer.measure_cycles(|| {
+                execute(&mut state, baseline_inputs[i].clone());
+            });
+            pilot_cycles.push(cycles);
+
+            let cycles = timer.measure_cycles(|| {
+                execute(&mut state, sample_inputs[i].clone());
+            });
+            pilot_cycles.push(cycles);
+        }
+
+        // Check if operation is measurable
+        pilot_cycles.sort_unstable();
+        let median_cycles = pilot_cycles[pilot_cycles.len() / 2];
+        let median_ns = timer.cycles_to_ns(median_cycles);
+        let resolution_ns = timer.resolution_ns();
+        let ticks_per_call = median_ns / resolution_ns;
+
+        let batching = if ticks_per_call < crate::measurement::MIN_TICKS_SINGLE_CALL {
+            // Operation is too fast to measure reliably
+            let threshold_ns = resolution_ns * crate::measurement::MIN_TICKS_SINGLE_CALL;
+
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let suggestion = ". On macOS, run with sudo to enable kperf cycle counting (~1ns resolution)";
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let suggestion = ". Run with sudo and --features perf for cycle-accurate timing";
+            #[cfg(not(target_arch = "aarch64"))]
+            let suggestion = "";
+
+            crate::result::BatchingInfo {
+                enabled: false,
+                k: 1,
+                ticks_per_batch: ticks_per_call,
+                rationale: format!(
+                    "UNMEASURABLE: {:.1} ticks/call < {:.0} minimum (op ~{:.0}ns, threshold ~{:.0}ns){}",
+                    ticks_per_call,
+                    crate::measurement::MIN_TICKS_SINGLE_CALL,
+                    median_ns,
+                    threshold_ns,
+                    suggestion
+                ),
+                unmeasurable: Some(crate::result::UnmeasurableInfo {
+                    operation_ns: median_ns,
+                    threshold_ns,
+                    ticks_per_call,
+                }),
+            }
+        } else {
+            // Measurable - proceed without batching (stateful operations can't batch)
+            crate::result::BatchingInfo {
+                enabled: false,
+                k: 1,
+                ticks_per_batch: ticks_per_call,
+                rationale: format!(
+                    "test_with_state: no batching for stateful operations ({:.1} ticks/call)",
+                    ticks_per_call
+                ),
+                unmeasurable: None,
+            }
+        };
+
+        // Create randomized schedule (interleaves baseline and sample measurements)
         let mut schedule: Vec<(crate::types::Class, usize)> =
             Vec::with_capacity(self.config.samples * 2);
         for i in 0..self.config.samples {
-            schedule.push((crate::types::Class::Fixed, i));
-            schedule.push((crate::types::Class::Random, i));
+            schedule.push((crate::types::Class::Baseline, i));
+            schedule.push((crate::types::Class::Sample, i));
         }
         schedule.shuffle(rng);
 
         // Collect timing samples
-        let mut fixed_cycles = Vec::with_capacity(self.config.samples);
-        let mut random_cycles = Vec::with_capacity(self.config.samples);
+        let mut baseline_cycles = Vec::with_capacity(self.config.samples);
+        let mut sample_cycles = Vec::with_capacity(self.config.samples);
         let mut interleaved_cycles = Vec::with_capacity(self.config.samples * 2);
+        let mut interleaved_classes = Vec::with_capacity(self.config.samples * 2);
 
         for (class, idx) in schedule {
             match class {
-                crate::types::Class::Fixed => {
+                crate::types::Class::Baseline => {
                     let cycles = timer.measure_cycles(|| {
-                        execute(&mut state, fixed_inputs[idx].clone());
+                        execute(&mut state, baseline_inputs[idx].clone());
                     });
-                    fixed_cycles.push(cycles);
+                    baseline_cycles.push(cycles);
                     interleaved_cycles.push(cycles);
+                    interleaved_classes.push(crate::types::Class::Baseline);
                 }
-                crate::types::Class::Random => {
+                crate::types::Class::Sample => {
                     let cycles = timer.measure_cycles(|| {
-                        execute(&mut state, random_inputs[idx].clone());
+                        execute(&mut state, sample_inputs[idx].clone());
                     });
-                    random_cycles.push(cycles);
+                    sample_cycles.push(cycles);
                     interleaved_cycles.push(cycles);
+                    interleaved_classes.push(crate::types::Class::Sample);
                 }
             }
         }
 
         // Run the analysis pipeline
-        self.run_pipeline(
+        let result = self.run_pipeline(
             PipelineInputs {
-                fixed_cycles,
-                random_cycles,
+                baseline_cycles,
+                sample_cycles,
                 interleaved_cycles,
-                fixed_gen_time_ns: Some(fixed_gen_time_ns),
-                random_gen_time_ns: Some(random_gen_time_ns),
-                batching: BatchingInfo {
-                    enabled: false,
-                    k: 1,
-                    ticks_per_batch: 0.0,
-                    rationale: "test_with_state doesn't use batching".to_string(),
-                    unmeasurable: None,
-                },
+                interleaved_classes,
+                baseline_gen_time_ns: Some(baseline_gen_time_ns),
+                sample_gen_time_ns: Some(sample_gen_time_ns),
+                batching: batching.clone(),
             },
             &timer,
             start_time,
-        )
+        );
+
+        // Wrap result in Outcome enum based on measurability
+        if let Some(unmeasurable_info) = &batching.unmeasurable {
+            // Operation was too fast to measure reliably
+            let platform = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                "Apple Silicon (cntvct_el0, ~42ns resolution)"
+            } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                "ARM64 Linux (cntvct_el0, ~40ns resolution)"
+            } else if cfg!(target_arch = "x86_64") {
+                "x86_64 (rdtsc, ~1ns resolution)"
+            } else {
+                "Unknown platform"
+            };
+
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let recommendation = "Run with sudo to enable kperf cycle counting (~1ns resolution), or increase operation complexity";
+
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let recommendation = "Run with sudo and --features perf for cycle-accurate timing, or increase operation complexity";
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let recommendation = "Increase operation complexity (current operation is too fast to measure reliably)";
+
+            crate::result::Outcome::Unmeasurable {
+                operation_ns: unmeasurable_info.operation_ns,
+                threshold_ns: unmeasurable_info.threshold_ns,
+                platform: platform.to_string(),
+                recommendation: recommendation.to_string(),
+            }
+        } else {
+            // Measurement was successful
+            crate::result::Outcome::Completed(result)
+        }
     }
 
     /// Run the full analysis pipeline on collected samples.
     fn run_pipeline(
         &self,
         inputs: PipelineInputs,
-        timer: &Timer,
+        timer: &BoxedTimer,
         start_time: Instant,
     ) -> TestResult {
+        use crate::types::TimingSample;
+
         let PipelineInputs {
-            fixed_cycles,
-            random_cycles,
+            baseline_cycles,
+            sample_cycles,
             interleaved_cycles,
-            fixed_gen_time_ns,
-            random_gen_time_ns,
+            interleaved_classes,
+            baseline_gen_time_ns,
+            sample_gen_time_ns,
             batching,
         } = inputs;
         if batching.unmeasurable.is_some() {
             let runtime_secs = start_time.elapsed().as_secs_f64();
-            let timer_name = if cfg!(target_arch = "x86_64") {
-                "rdtsc"
-            } else if cfg!(target_arch = "aarch64") {
-                "cntvct_el0"
-            } else {
-                "Instant"
-            };
+            let timer_name = timer.name();
 
             return TestResult {
                 leak_probability: 0.0,
+                bayes_factor: 1.0, // Neutral evidence
                 effect: None,
                 exploitability: Exploitability::Negligible,
                 min_detectable_effect: MinDetectableEffect {
@@ -505,13 +764,15 @@ impl TimingOracle {
                 ci_gate: CiGate {
                     alpha: self.config.ci_alpha,
                     passed: true,
-                    thresholds: [0.0; 9],
+                    threshold: 0.0,
+                    max_observed: 0.0,
                     observed: [0.0; 9],
                 },
                 quality: MeasurementQuality::TooNoisy,
                 outlier_fraction: 0.0,
+                diagnostics: Diagnostics::all_ok(),
                 metadata: Metadata {
-                    samples_per_class: fixed_cycles.len().min(random_cycles.len()),
+                    samples_per_class: baseline_cycles.len().min(sample_cycles.len()),
                     cycles_per_ns: timer.cycles_per_ns(),
                     timer: timer_name.to_string(),
                     timer_resolution_ns: timer.resolution_ns(),
@@ -521,93 +782,211 @@ impl TimingOracle {
             };
         }
 
+        // Get timer name for metadata
+        let timer_name = timer.name();
+
         // Step 3a: Filter out zero measurements (kperf read failures)
         // kperf returns 0 on counter reset/read failure, which pollutes lower quantiles
-        let fixed_nonzero: Vec<u64> = fixed_cycles.iter().copied().filter(|&c| c > 0).collect();
-        let random_nonzero: Vec<u64> = random_cycles.iter().copied().filter(|&c| c > 0).collect();
+        let baseline_nonzero: Vec<u64> = baseline_cycles.iter().copied().filter(|&c| c > 0).collect();
+        let sample_nonzero: Vec<u64> = sample_cycles.iter().copied().filter(|&c| c > 0).collect();
 
         // If too many zeros were filtered, warn but continue
-        let fixed_zeros = fixed_cycles.len() - fixed_nonzero.len();
-        let random_zeros = random_cycles.len() - random_nonzero.len();
-        if fixed_zeros > fixed_cycles.len() / 10 || random_zeros > random_cycles.len() / 10 {
+        let baseline_zeros = baseline_cycles.len() - baseline_nonzero.len();
+        let sample_zeros = sample_cycles.len() - sample_nonzero.len();
+        if baseline_zeros > baseline_cycles.len() / 10 || sample_zeros > sample_cycles.len() / 10 {
             eprintln!(
-                "Warning: Filtered {} fixed and {} random zero measurements (>10%). \
+                "Warning: Filtered {} baseline and {} sample zero measurements (>10%). \
                  This may indicate kperf instability.",
-                fixed_zeros, random_zeros
+                baseline_zeros, sample_zeros
             );
         }
 
         // Step 3b: Outlier filtering (pooled symmetric)
-        let (filtered_fixed, filtered_random, outlier_stats) =
-            filter_outliers(&fixed_nonzero, &random_nonzero, self.config.outlier_percentile);
+        let (filtered_baseline, filtered_sample, outlier_stats) =
+            filter_outliers(&baseline_nonzero, &sample_nonzero, self.config.outlier_percentile);
 
-        eprintln!("[DEBUG] After outlier filtering ({}): fixed={} (removed {}), random={} (removed {})",
+        // Also filter interleaved samples using the same threshold
+        let outlier_threshold = outlier_stats.threshold;
+        let filtered_interleaved: Vec<(u64, Class)> = interleaved_cycles
+            .iter()
+            .zip(interleaved_classes.iter())
+            .filter(|(&c, _)| c > 0 && c <= outlier_threshold)
+            .map(|(&c, &class)| (c, class))
+            .collect();
+
+        eprintln!("[DEBUG] After outlier filtering ({}): baseline={} (removed {}), sample={} (removed {}), interleaved={}",
             self.config.outlier_percentile,
-            filtered_fixed.len(),
-            fixed_nonzero.len() - filtered_fixed.len(),
-            filtered_random.len(),
-            random_nonzero.len() - filtered_random.len());
+            filtered_baseline.len(),
+            baseline_nonzero.len() - filtered_baseline.len(),
+            filtered_sample.len(),
+            sample_nonzero.len() - filtered_sample.len(),
+            filtered_interleaved.len());
 
         // Convert cycles to nanoseconds
-        let fixed_ns: Vec<f64> = filtered_fixed
+        let baseline_ns: Vec<f64> = filtered_baseline
             .iter()
             .map(|&c| timer.cycles_to_ns(c))
             .collect();
-        let random_ns: Vec<f64> = filtered_random
+        let sample_ns: Vec<f64> = filtered_sample
             .iter()
             .map(|&c| timer.cycles_to_ns(c))
+            .collect();
+
+        // Convert interleaved to TimingSample (nanoseconds with class labels)
+        let interleaved_samples: Vec<TimingSample> = filtered_interleaved
+            .iter()
+            .map(|&(c, class)| TimingSample {
+                time_ns: timer.cycles_to_ns(c),
+                class,
+            })
             .collect();
 
         // Step 4: Compute full-sample quantile differences for CI gate
-        let q_fixed_full = compute_deciles_fast(&fixed_ns);
-        let q_random_full = compute_deciles_fast(&random_ns);
-        let delta_full: Vector9 = q_fixed_full - q_random_full;
+        let q_baseline_full = compute_deciles_fast(&baseline_ns);
+        let q_sample_full = compute_deciles_fast(&sample_ns);
+        let delta_full: Vector9 = q_baseline_full - q_sample_full;
 
         // Step 5: Sample splitting (calibration/inference)
-        let n = fixed_ns.len().min(random_ns.len());
-        let n_calib = ((n as f64) * self.config.calibration_fraction as f64).round() as usize;
-        let n_calib = n_calib.max(10).min(n.saturating_sub(10)); // Ensure at least 10 samples each
+        let n = baseline_ns.len().min(sample_ns.len());
 
-        // Split samples temporally (no shuffling - preserves autocorrelation for block bootstrap)
-        let (calib_fixed, infer_fixed) = split_calibration_temporal(&fixed_ns, n_calib);
-        let (calib_random, infer_random) = split_calibration_temporal(&random_ns, n_calib);
+        // Check minimum sample requirements (spec §2.3):
+        // - ≥ 200: Normal 30/70 split
+        // - 100–199: Warning; normal split with reduced reliability
+        // - 50–99: Warning; use 50/50 split
+        // - < 50: Return Unmeasurable (statistics meaningless)
+        const MIN_SAMPLES_UNMEASURABLE: usize = 50;
+        const MIN_SAMPLES_WARNING: usize = 100;
+        const MIN_SAMPLES_NORMAL: usize = 200;
 
-        eprintln!("[DEBUG] After calibration split ({:.0}% calib, {:.0}% infer): calib_fixed={}, calib_random={}, infer_fixed={}, infer_random={}",
-            self.config.calibration_fraction * 100.0,
-            (1.0 - self.config.calibration_fraction) * 100.0,
-            calib_fixed.len(),
-            calib_random.len(),
-            infer_fixed.len(),
-            infer_random.len());
+        if n < MIN_SAMPLES_UNMEASURABLE {
+            // Too few samples for any meaningful statistics - return minimal result
+            let runtime_secs = start_time.elapsed().as_secs_f64();
+            let timer_name = if cfg!(target_arch = "x86_64") {
+                "rdtsc"
+            } else if cfg!(target_arch = "aarch64") {
+                "cntvct_el0"
+            } else {
+                "Instant"
+            };
+
+            eprintln!(
+                "[ERROR] Only {} samples after filtering (minimum: {}). \
+                 Statistics are meaningless with so few samples.",
+                n, MIN_SAMPLES_UNMEASURABLE
+            );
+
+            return TestResult {
+                leak_probability: 0.5, // Maximum uncertainty
+                bayes_factor: 1.0, // Neutral evidence
+                effect: None,
+                exploitability: Exploitability::Negligible,
+                min_detectable_effect: MinDetectableEffect {
+                    shift_ns: f64::INFINITY,
+                    tail_ns: f64::INFINITY,
+                },
+                ci_gate: CiGate {
+                    alpha: self.config.ci_alpha,
+                    passed: true, // Don't fail CI on unmeasurable
+                    threshold: f64::INFINITY,
+                    max_observed: 0.0,
+                    observed: [0.0; 9],
+                },
+                quality: MeasurementQuality::TooNoisy,
+                outlier_fraction: outlier_stats.outlier_fraction,
+                diagnostics: Diagnostics::all_ok(),
+                metadata: Metadata {
+                    samples_per_class: n,
+                    cycles_per_ns: timer.cycles_per_ns(),
+                    timer: timer_name.to_string(),
+                    timer_resolution_ns: timer.resolution_ns(),
+                    batching,
+                    runtime_secs,
+                },
+            };
+        }
+
+        // Determine split strategy based on sample count
+        let use_half_split = n < MIN_SAMPLES_WARNING;
+        let calib_fraction = if use_half_split { 0.5 } else { self.config.calibration_fraction as f64 };
+
+        if n < MIN_SAMPLES_WARNING {
+            eprintln!(
+                "[WARNING] Only {} samples (recommended: ≥{}). Using 50/50 split.",
+                n, MIN_SAMPLES_NORMAL
+            );
+        } else if n < MIN_SAMPLES_NORMAL {
+            eprintln!(
+                "[WARNING] Only {} samples (recommended: ≥{}). Reduced reliability.",
+                n, MIN_SAMPLES_NORMAL
+            );
+        }
+
+        // Split interleaved samples for calibration (preserves temporal order for joint resampling)
+        let n_interleaved = interleaved_samples.len();
+        let n_calib_interleaved = ((n_interleaved as f64) * calib_fraction).round() as usize;
+
+        let (calib_interleaved, infer_interleaved) = {
+            let (calib, infer) = interleaved_samples.split_at(n_calib_interleaved);
+            (calib.to_vec(), infer.to_vec())
+        };
+
+        // Also split baseline/sample for other computations
+        let n_calib = ((n as f64) * calib_fraction).round() as usize;
+        let (_, i_b) = split_calibration_temporal(&baseline_ns, n_calib);
+        let (_, i_s) = split_calibration_temporal(&sample_ns, n_calib);
+        let (infer_baseline, infer_sample) = (i_b, i_s);
+
+        eprintln!("[DEBUG] After calibration split ({:.0}% calib, {:.0}% infer): calib_interleaved={}, infer_baseline={}, infer_sample={}",
+            calib_fraction * 100.0,
+            (1.0 - calib_fraction) * 100.0,
+            calib_interleaved.len(),
+            infer_baseline.len(),
+            infer_sample.len());
 
         // Run preflight checks
-        let interleaved_ns: Vec<f64> = interleaved_cycles
+        let interleaved_ns: Vec<f64> = interleaved_samples
             .iter()
-            .map(|&c| timer.cycles_to_ns(c))
+            .map(|s| s.time_ns)
             .collect();
         let _preflight = run_all_checks(
-            &fixed_ns,
-            &random_ns,
+            &baseline_ns,
+            &sample_ns,
             &interleaved_ns,
-            fixed_gen_time_ns,
-            random_gen_time_ns,
+            baseline_gen_time_ns,
+            sample_gen_time_ns,
             timer.resolution_ns(),
         );
 
         // CALIBRATION PHASE
-        // Step 6: Estimate per-class covariances from calibration data
-        let bootstrap_iters = self.config.cov_bootstrap_iterations.min(500);
-
-        let cov_fixed = bootstrap_covariance_matrix(&calib_fixed, bootstrap_iters, 42);
-        let cov_random = bootstrap_covariance_matrix(&calib_random, bootstrap_iters, 43);
-
-        // Step 7: Estimate MDE from calibration covariance
-        let pooled_cov = cov_fixed.matrix + cov_random.matrix;
-        let mde_estimate = estimate_mde(
-            &pooled_cov,
-            100, // Reduced simulations for speed
-            (1e6, 1e6), // Weak prior for near-MLE estimates
+        // Step 6: Estimate covariance of Δ* = q_F* - q_R* via joint bootstrap
+        // Joint resampling preserves temporal pairing for correct Var(Δ) estimation
+        let calib_cov_estimate = bootstrap_difference_covariance(
+            &calib_interleaved,
+            self.config.cov_bootstrap_iterations,
+            42,
         );
+        // Save calibration covariance for diagnostics (before scaling)
+        let calib_cov = calib_cov_estimate.matrix;
+
+        // Compute inference covariance for diagnostics stationarity check
+        let infer_cov_estimate = bootstrap_difference_covariance(
+            &infer_interleaved,
+            self.config.cov_bootstrap_iterations,
+            42,
+        );
+        let infer_cov = infer_cov_estimate.matrix;
+
+        // Step 6b: Scale covariance from calibration to inference sample sizes
+        // Quantile variance scales as 1/n
+        let n_calib = calib_interleaved.len();
+        let n_infer = infer_baseline.len() + infer_sample.len();
+        let scaled_cov = scale_covariance_for_inference(calib_cov, n_calib, n_infer);
+
+        // Step 6c: Apply variance floor for numerical stability
+        let pooled_cov = apply_variance_floor(scaled_cov, timer.resolution_ns());
+
+        // Step 7: Estimate MDE from covariance (spec §2.7)
+        let mde_estimate = estimate_mde(&pooled_cov, self.config.ci_alpha);
 
         // Prior scales from calibration (spec: max(2*MDE, min_effect_of_concern))
         let min_effect = self.config.min_effect_of_concern_ns;
@@ -618,22 +997,23 @@ impl TimingOracle {
 
         // INFERENCE PHASE
         // Step 8: Compute quantile difference vector from inference data
-        let q_fixed = compute_deciles_fast(&infer_fixed);
-        let q_random = compute_deciles_fast(&infer_random);
-        let delta_infer: Vector9 = q_fixed - q_random;
+        let q_baseline = compute_deciles_fast(&infer_baseline);
+        let q_sample = compute_deciles_fast(&infer_sample);
+        let delta_infer: Vector9 = q_baseline - q_sample;
 
-        // Use calibration covariance for inference per spec
+        // Use scaled covariance for inference
         let cov_estimate = pooled_cov;
 
         // Step 9: Run CI Gate (Layer 1)
         let ci_gate_input = CiGateInput {
             observed_diff: delta_full,
-            fixed_samples: &fixed_ns,
-            random_samples: &random_ns,
+            baseline_samples: &baseline_ns,
+            sample_samples: &sample_ns,
             alpha: self.config.ci_alpha,
             bootstrap_iterations: self.config.ci_bootstrap_iterations,
             seed: self.config.measurement_seed,
             timer_resolution_ns: timer.resolution_ns(),
+            min_effect_of_concern: self.config.min_effect_of_concern_ns,
         };
         let ci_gate = run_ci_gate(&ci_gate_input);
 
@@ -643,17 +1023,25 @@ impl TimingOracle {
         let leak_probability = bayes_result.posterior_probability;
 
         // Step 11: Effect decomposition (if leak detected)
-        let effect = if leak_probability > 0.5 || !ci_gate.passed {
-            let decomp = decompose_effect(
-                &delta_infer,
-                &cov_estimate,
-                prior_sigmas,
-            );
+        // Also compute for diagnostics even if not returning effect
+        let decomp = decompose_effect(
+            &delta_infer,
+            &cov_estimate,
+            prior_sigmas,
+        );
+        // Convert Vector2 to [f64; 2] for diagnostics
+        let posterior_mean = [decomp.posterior_mean[0], decomp.posterior_mean[1]];
 
+        let effect = if leak_probability > 0.5 || !ci_gate.passed {
+            // Scale batch-total effects to per-call effects by dividing by K
+            let k_scale = batching.k as f64;
             Some(Effect {
-                shift_ns: decomp.posterior_mean[0],
-                tail_ns: decomp.posterior_mean[1],
-                credible_interval_ns: decomp.effect_magnitude_ci,
+                shift_ns: decomp.posterior_mean[0] / k_scale,
+                tail_ns: decomp.posterior_mean[1] / k_scale,
+                credible_interval_ns: (
+                    decomp.effect_magnitude_ci.0 / k_scale,
+                    decomp.effect_magnitude_ci.1 / k_scale,
+                ),
                 pattern: decomp.pattern,
             })
         } else {
@@ -668,38 +1056,47 @@ impl TimingOracle {
         let exploitability = Exploitability::from_effect_ns(effect_magnitude);
 
         // Step 13: Measurement quality assessment
-        let quality = MeasurementQuality::from_mde_ns(mde_estimate.shift_ns);
-
-        // Timer identification
-        let timer_name = if cfg!(target_arch = "x86_64") {
-            "rdtsc"
-        } else if cfg!(target_arch = "aarch64") {
-            "cntvct_el0"
-        } else {
-            "Instant"
+        // MDE also needs to be scaled to per-call
+        let k_scale = batching.k as f64;
+        let scaled_mde = MinDetectableEffect {
+            shift_ns: mde_estimate.shift_ns / k_scale,
+            tail_ns: mde_estimate.tail_ns / k_scale,
         };
+        let quality = MeasurementQuality::from_mde_ns(scaled_mde.shift_ns);
 
         let runtime_secs = start_time.elapsed().as_secs_f64();
 
-        // Step 14: Assemble and return TestResult
+        // Step 14: Compute Bayes factor from log BF (clamped for numerical stability)
+        let bayes_factor = bayes_result.log_bayes_factor.exp().clamp(1e-100, 1e100);
+
+        // Step 15: Compute diagnostics (stationarity, model fit, outlier asymmetry)
+        let diagnostics = compute_diagnostics(
+            &calib_cov,
+            &infer_cov,
+            &delta_infer,
+            &posterior_mean,
+            &outlier_stats,
+        );
+
+        // Step 16: Assemble and return TestResult
         TestResult {
             leak_probability,
+            bayes_factor,
             effect,
             exploitability,
-            min_detectable_effect: MinDetectableEffect {
-                shift_ns: mde_estimate.shift_ns,
-                tail_ns: mde_estimate.tail_ns,
-            },
+            min_detectable_effect: scaled_mde,
             ci_gate: CiGate {
                 alpha: ci_gate.alpha,
                 passed: ci_gate.passed,
-                thresholds: ci_gate.thresholds,
+                threshold: ci_gate.threshold,
+                max_observed: ci_gate.max_observed,
                 observed: ci_gate.observed,
             },
             quality,
             outlier_fraction: outlier_stats.outlier_fraction,
+            diagnostics,
             metadata: Metadata {
-                samples_per_class: infer_fixed.len().min(infer_random.len()),
+                samples_per_class: infer_baseline.len().min(infer_sample.len()),
                 cycles_per_ns: timer.cycles_per_ns(),
                 timer: timer_name.to_string(),
                 timer_resolution_ns: timer.resolution_ns(),
@@ -771,10 +1168,21 @@ mod tests {
     }
 
     #[test]
-    fn test_oracle_with_timer() {
-        let timer = Timer::with_cycles_per_ns(3.0);
-        let oracle = TimingOracle::quick().with_timer(timer);
-        assert!(oracle.timer.is_some());
-        assert_eq!(oracle.timer.unwrap().cycles_per_ns(), 3.0);
+    fn test_oracle_timer_spec() {
+        // Test default is Auto
+        let oracle = TimingOracle::quick();
+        assert_eq!(oracle.timer_spec, TimerSpec::Auto);
+
+        // Test standard_timer() helper
+        let oracle = TimingOracle::quick().standard_timer();
+        assert_eq!(oracle.timer_spec, TimerSpec::Standard);
+
+        // Test prefer_pmu() helper
+        let oracle = TimingOracle::quick().prefer_pmu();
+        assert_eq!(oracle.timer_spec, TimerSpec::PreferPmu);
+
+        // Test explicit timer_spec()
+        let oracle = TimingOracle::quick().timer_spec(TimerSpec::Standard);
+        assert_eq!(oracle.timer_spec, TimerSpec::Standard);
     }
 }

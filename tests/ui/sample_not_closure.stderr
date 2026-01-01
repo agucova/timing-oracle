@@ -1,0 +1,19 @@
+error: `sample` must be a closure.
+
+       Hint: Use `sample: || expr` instead of `sample: expr`.
+
+       This is intentional - a closure makes it clear that the expression
+       is evaluated freshly for each sample, not captured once.
+
+       Example:
+
+       // WRONG: Pre-evaluated value
+       let value = rand::random();
+       timing_test! { sample: value, ... }
+
+       // CORRECT: Fresh value per sample
+       timing_test! { sample: || rand::random(), ... }
+ --> tests/ui/sample_not_closure.rs:8:17
+  |
+8 |         sample: value,  // Should be || value
+  |                 ^^^^^

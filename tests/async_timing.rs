@@ -65,21 +65,16 @@ fn async_executor_overhead_no_false_positive() {
 
     // Pre-generate inputs using InputPair helper
     const SAMPLES: usize = 10_000;
-    let inputs = InputPair::with_samples(SAMPLES, fixed_input, rand_bytes);
+    let inputs = InputPair::new(|| fixed_input, rand_bytes);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
         .ci_alpha(0.01)
-        .test(
-            || {
-                let data = inputs.fixed();
-                rt.block_on(async { std::hint::black_box(data) })
-            },
-            || {
-                let data = inputs.random();
-                rt.block_on(async { std::hint::black_box(data) })
-            },
-        );
+        .test(inputs, |data| {
+            rt.block_on(async { std::hint::black_box(data); })
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[async_executor_overhead_no_false_positive]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -98,22 +93,19 @@ fn async_executor_overhead_no_false_positive() {
 fn async_block_on_overhead_symmetric() {
     let rt = single_thread_runtime();
 
-    let result = TimingOracle::new()
+    // Use unit type for input (no data dependency)
+    let inputs = InputPair::new(|| (), || ());
+
+    let outcome = TimingOracle::new()
         .samples(8_000)
-        .test(
-            || {
-                rt.block_on(async {
-                    // Minimal async block
-                    std::hint::black_box(42)
-                })
-            },
-            || {
-                rt.block_on(async {
-                    // Minimal async block
-                    std::hint::black_box(43)
-                })
-            },
-        );
+        .test(inputs, |_| {
+            rt.block_on(async {
+                // Minimal async block
+                std::hint::black_box(42);
+            })
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[async_block_on_overhead_symmetric]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -134,30 +126,25 @@ fn async_block_on_overhead_symmetric() {
 #[test]
 fn detects_conditional_await_timing() {
     let rt = single_thread_runtime();
-    let secret = true;
 
-    let result = TimingOracle::new()
+    // Use unit type for input; secret-dependent logic is in the operation
+    let inputs = InputPair::new(|| true, || false);
+
+    let outcome = TimingOracle::new()
         .samples(50_000)
         .ci_alpha(0.01)
-        .test(
-            || {
-                rt.block_on(async {
-                    if secret {
-                        // Extra await when secret is true
-                        sleep(Duration::from_nanos(100)).await;
-                    }
-                    sleep(Duration::from_micros(5)).await;
-                    std::hint::black_box(42)
-                })
-            },
-            || {
-                rt.block_on(async {
-                    // No extra await
-                    sleep(Duration::from_micros(5)).await;
-                    std::hint::black_box(42)
-                })
-            },
-        );
+        .test(inputs, |secret| {
+            rt.block_on(async {
+                if *secret {
+                    // Extra await when secret is true
+                    sleep(Duration::from_nanos(100)).await;
+                }
+                sleep(Duration::from_micros(5)).await;
+                std::hint::black_box(42);
+            })
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[detects_conditional_await_timing]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -176,39 +163,25 @@ fn detects_early_exit_async() {
     let rt = single_thread_runtime();
     let secret = [0xABu8; 32];
 
-    // Pre-generate test inputs
-    let matching_input = [0xABu8; 32];
-    let different_input = [0xCDu8; 32];
+    // Use InputPair with fixed vs random input for comparison
+    let inputs = InputPair::new(|| [0xABu8; 32], || [0xCDu8; 32]);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(50_000)
-        .test(
-            || {
-                rt.block_on(async {
-                    // Compare with matching input - goes through all bytes
-                    for i in 0..32 {
-                        if secret[i] != matching_input[i] {
-                            return std::hint::black_box(false);
-                        }
-                        // Small async point to make timing observable
-                        tokio::task::yield_now().await;
+        .test(inputs, |comparison_input| {
+            rt.block_on(async {
+                // Compare with input - goes through bytes or exits early
+                for i in 0..32 {
+                    if secret[i] != comparison_input[i] {
+                        return;
                     }
-                    std::hint::black_box(true)
-                })
-            },
-            || {
-                rt.block_on(async {
-                    // Compare with different input - exits early at first byte
-                    for i in 0..32 {
-                        if secret[i] != different_input[i] {
-                            return std::hint::black_box(false);
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                    std::hint::black_box(true)
-                })
-            },
-        );
+                    // Small async point to make timing observable
+                    tokio::task::yield_now().await;
+                }
+            })
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[detects_early_exit_async]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -227,29 +200,22 @@ fn detects_early_exit_async() {
 #[ignore = "slow test - run with --ignored"]
 fn detects_secret_dependent_sleep() {
     let rt = single_thread_runtime();
-    let secret_byte = 10u8;
-    let random_byte = 1u8;
 
-    let result = TimingOracle::new()
+    // InputPair with secret byte (fixed) vs random byte values
+    let inputs = InputPair::new(|| 10u8, || 1u8);
+
+    let outcome = TimingOracle::new()
         .samples(100_000)
-        .test(
-            || {
-                rt.block_on(async {
-                    // Sleep duration depends on secret
-                    let delay_micros = secret_byte as u64 * 10;
-                    sleep(Duration::from_micros(delay_micros)).await;
-                    std::hint::black_box(42)
-                })
-            },
-            || {
-                rt.block_on(async {
-                    // Different sleep duration
-                    let delay_micros = random_byte as u64 * 10;
-                    sleep(Duration::from_micros(delay_micros)).await;
-                    std::hint::black_box(42)
-                })
-            },
-        );
+        .test(inputs, |byte_value| {
+            rt.block_on(async {
+                // Sleep duration depends on the byte value
+                let delay_micros = *byte_value as u64 * 10;
+                sleep(Duration::from_micros(delay_micros)).await;
+                std::hint::black_box(42);
+            })
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[detects_secret_dependent_sleep]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -282,36 +248,23 @@ fn concurrent_tasks_no_crosstalk() {
 
     // Pre-generate inputs using InputPair helper
     const SAMPLES: usize = 10_000;
-    let inputs = InputPair::with_samples(SAMPLES, fixed_input, rand_bytes);
+    let inputs = InputPair::new(|| fixed_input, rand_bytes);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                let data = inputs.fixed();
-                rt.block_on(async {
-                    // Spawn background tasks
-                    for _ in 0..10 {
-                        tokio::spawn(async {
-                            sleep(Duration::from_micros(100)).await;
-                        });
-                    }
-                    std::hint::black_box(data)
-                })
-            },
-            || {
-                let data = inputs.random();
-                rt.block_on(async {
-                    // Same background tasks
-                    for _ in 0..10 {
-                        tokio::spawn(async {
-                            sleep(Duration::from_micros(100)).await;
-                        });
-                    }
-                    std::hint::black_box(data)
-                })
-            },
-        );
+        .test(inputs, |data| {
+            rt.block_on(async {
+                // Spawn background tasks
+                for _ in 0..10 {
+                    tokio::spawn(async {
+                        sleep(Duration::from_micros(100)).await;
+                    });
+                }
+                std::hint::black_box(data);
+            })
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[concurrent_tasks_no_crosstalk]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -331,35 +284,25 @@ fn concurrent_tasks_no_crosstalk() {
 #[ignore = "slow test - run with --ignored"]
 fn detects_task_spawn_timing_leak() {
     let rt = multi_thread_runtime();
-    let secret_count = 10usize;
 
-    let result = TimingOracle::new()
+    // InputPair with fixed count vs random count generator
+    let inputs = InputPair::new(|| 10usize, || rand::random::<u32>() as usize % 20);
+
+    let outcome = TimingOracle::new()
         .samples(50_000)
-        .test(
-            || {
-                rt.block_on(async {
-                    // Fixed task count based on secret
-                    for _ in 0..secret_count {
-                        tokio::spawn(async {
-                            sleep(Duration::from_nanos(10)).await;
-                        });
-                    }
-                    std::hint::black_box(42)
-                })
-            },
-            || {
-                rt.block_on(async {
-                    // Random task count
-                    let random_count = rand::random::<u32>() as usize % 20;
-                    for _ in 0..random_count {
-                        tokio::spawn(async {
-                            sleep(Duration::from_nanos(10)).await;
-                        });
-                    }
-                    std::hint::black_box(42)
-                })
-            },
-        );
+        .test(inputs, |count| {
+            rt.block_on(async {
+                // Spawn task count based on input
+                for _ in 0..*count {
+                    tokio::spawn(async {
+                        sleep(Duration::from_nanos(10)).await;
+                    });
+                }
+                std::hint::black_box(42);
+            })
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[detects_task_spawn_timing_leak]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -381,42 +324,27 @@ fn detects_task_spawn_timing_leak() {
 #[test]
 #[ignore = "slow comparative test - run with --ignored"]
 fn tokio_single_vs_multi_thread_stability() {
-    // Pre-generate inputs using InputPair helper
     const SAMPLES: usize = 20_000;
-    let inputs = InputPair::with_samples(SAMPLES, [0xABu8; 32], rand_bytes);
 
     // Test with single-threaded runtime
     let rt_single = single_thread_runtime();
-    let result_single = TimingOracle::new()
+    let inputs_single = InputPair::new(|| [0xABu8; 32], rand_bytes);
+    let outcome_single = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                let data = inputs.fixed();
-                rt_single.block_on(async { std::hint::black_box(data) })
-            },
-            || {
-                let data = inputs.random();
-                rt_single.block_on(async { std::hint::black_box(data) })
-            },
-        );
-
-    // Reset for the next test
-    inputs.reset();
+        .test(inputs_single, |data| {
+            rt_single.block_on(async { std::hint::black_box(data); })
+        });
+    let result_single = outcome_single.unwrap_completed();
 
     // Test with multi-threaded runtime
     let rt_multi = multi_thread_runtime();
-    let result_multi = TimingOracle::new()
+    let inputs_multi = InputPair::new(|| [0xABu8; 32], rand_bytes);
+    let outcome_multi = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                let data = inputs.fixed();
-                rt_multi.block_on(async { std::hint::black_box(data) })
-            },
-            || {
-                let data = inputs.random();
-                rt_multi.block_on(async { std::hint::black_box(data) })
-            },
-        );
+        .test(inputs_multi, |data| {
+            rt_multi.block_on(async { std::hint::black_box(data); })
+        });
+    let result_multi = outcome_multi.unwrap_completed();
 
     eprintln!("\n[tokio_single_vs_multi_thread_stability]");
     eprintln!("--- Single-thread ---");
@@ -440,28 +368,22 @@ fn tokio_single_vs_multi_thread_stability() {
 fn async_workload_flag_effectiveness() {
     let rt = single_thread_runtime();
 
-    // Without async_workload flag
-    let result_without_flag = TimingOracle::new()
+    // Use unit type for input (no data dependency)
+    let inputs = InputPair::new(|| (), || ());
+
+    let outcome_without_flag = TimingOracle::new()
         .samples(10_000)
-        .test(
-            || {
-                rt.block_on(async {
-                    // Some async work
-                    for _ in 0..5 {
-                        tokio::task::yield_now().await;
-                    }
-                    std::hint::black_box(42)
-                })
-            },
-            || {
-                rt.block_on(async {
-                    for _ in 0..5 {
-                        tokio::task::yield_now().await;
-                    }
-                    std::hint::black_box(43)
-                })
-            },
-        );
+        .test(inputs, |_| {
+            rt.block_on(async {
+                // Some async work
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                std::hint::black_box(42);
+            })
+        });
+
+    let result_without_flag = outcome_without_flag.unwrap_completed();
 
     eprintln!("\n[async_workload_flag_effectiveness]");
     eprintln!("{}", timing_oracle::output::format_result(&result_without_flag));

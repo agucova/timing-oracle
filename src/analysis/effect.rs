@@ -59,8 +59,9 @@ pub fn decompose_effect(
     covariance: &Matrix9,
     prior_sigmas: (f64, f64),
 ) -> EffectDecomposition {
-    // Build design matrix X = [ones | b_tail]
-    let design_matrix = build_design_matrix();
+    // Build design matrix X = [ones | b_tail_ortho]
+    // Orthogonalize b_tail with respect to ones under the Σ⁻¹ metric
+    let design_matrix = build_orthogonal_design_matrix(covariance);
 
     // Compute posterior using Bayesian linear regression
     let (posterior_mean, posterior_cov) =
@@ -88,13 +89,54 @@ pub fn decompose_effect(
     }
 }
 
-/// Build the 9x2 design matrix [ones | b_tail].
-fn build_design_matrix() -> Matrix9x2 {
-    let mut x = Matrix9x2::zeros();
+/// Build the 9x2 design matrix [ones | b_tail_ortho].
+///
+/// The tail basis is orthogonalized with respect to ones under the Σ⁻¹ metric
+/// using Gram-Schmidt: b_tail_ortho = b_tail - ((ones^T Σ⁻¹ b_tail) / (ones^T Σ⁻¹ ones)) * ones
+///
+/// This ensures the shift and tail components are truly independent in the
+/// posterior, allowing proper attribution of effects.
+fn build_orthogonal_design_matrix(covariance: &Matrix9) -> Matrix9x2 {
+    // Build ones and b_tail vectors
+    let ones = Vector9::from_fn(|i, _| ONES[i]);
+    let b_tail = Vector9::from_fn(|i, _| B_TAIL[i]);
 
+    // Compute Σ⁻¹ (with regularization if needed)
+    let sigma_inv = match Cholesky::new(*covariance) {
+        Some(chol) => chol.inverse(),
+        None => {
+            // Regularize if not positive definite
+            let regularized = covariance + Matrix9::identity() * 1e-10;
+            Cholesky::new(regularized)
+                .expect("Regularized covariance should be positive definite")
+                .inverse()
+        }
+    };
+
+    // Gram-Schmidt orthogonalization under Σ⁻¹ metric:
+    // b_tail_ortho = b_tail - proj_{ones}(b_tail)
+    // where proj_{ones}(b_tail) = ((ones^T Σ⁻¹ b_tail) / (ones^T Σ⁻¹ ones)) * ones
+    let sigma_inv_ones = sigma_inv * ones;
+    let sigma_inv_b_tail = sigma_inv * b_tail;
+
+    let ones_sigma_inv_ones = ones.dot(&sigma_inv_ones); // ones^T Σ⁻¹ ones
+    let ones_sigma_inv_b_tail = ones.dot(&sigma_inv_b_tail); // ones^T Σ⁻¹ b_tail
+
+    // Avoid division by zero
+    let projection_coef = if ones_sigma_inv_ones.abs() > 1e-12 {
+        ones_sigma_inv_b_tail / ones_sigma_inv_ones
+    } else {
+        0.0
+    };
+
+    // b_tail_ortho = b_tail - projection_coef * ones
+    let b_tail_ortho = b_tail - ones * projection_coef;
+
+    // Build design matrix
+    let mut x = Matrix9x2::zeros();
     for i in 0..9 {
-        x[(i, 0)] = ONES[i];
-        x[(i, 1)] = B_TAIL[i];
+        x[(i, 0)] = ones[i];
+        x[(i, 1)] = b_tail_ortho[i];
     }
 
     x
@@ -235,20 +277,14 @@ fn classify_pattern(posterior_mean: &Vector2, posterior_cov: &Matrix2) -> Effect
         (true, false) => EffectPattern::UniformShift,
         (false, true) => EffectPattern::TailEffect,
         (true, true) => EffectPattern::Mixed,
-        (false, false) => {
-            // Neither significant: classify by relative magnitude
-            if shift.abs() >= tail.abs() {
-                EffectPattern::UniformShift
-            } else {
-                EffectPattern::TailEffect
-            }
-        }
+        (false, false) => EffectPattern::Indeterminate,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::bayes::build_design_matrix;
 
     #[test]
     fn test_design_matrix_structure() {
@@ -287,5 +323,14 @@ mod tests {
         let cov = Matrix2::identity();
         let pattern = classify_pattern(&mean, &cov);
         assert_eq!(pattern, EffectPattern::TailEffect);
+    }
+
+    #[test]
+    fn test_classify_indeterminate() {
+        // Neither shift nor tail significant (both small relative to SE)
+        let mean = Vector2::new(0.5, 0.5);
+        let cov = Matrix2::identity();
+        let pattern = classify_pattern(&mean, &cov);
+        assert_eq!(pattern, EffectPattern::Indeterminate);
     }
 }

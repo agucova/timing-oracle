@@ -8,6 +8,10 @@ pub struct TestResult {
     /// Probability of timing leak given data and model (0.0 to 1.0).
     pub leak_probability: f64,
 
+    /// Bayes factor (BF₁₀): evidence ratio for timing leak vs no leak.
+    /// Values > 10 indicate strong evidence for leak, < 0.1 strong evidence against.
+    pub bayes_factor: f64,
+
     /// Effect size estimate (present if leak_probability > 0.5).
     pub effect: Option<Effect>,
 
@@ -25,6 +29,9 @@ pub struct TestResult {
 
     /// Fraction of samples trimmed as outliers.
     pub outlier_fraction: f64,
+
+    /// Diagnostic checks (stationarity, model fit, outlier asymmetry).
+    pub diagnostics: Diagnostics,
 
     /// Metadata for debugging.
     pub metadata: Metadata,
@@ -55,6 +62,8 @@ pub enum EffectPattern {
     TailEffect,
     /// Mixed pattern.
     Mixed,
+    /// Neither shift nor tail is statistically significant.
+    Indeterminate,
 }
 
 /// Minimum detectable effect at current noise level.
@@ -73,9 +82,11 @@ pub struct CiGate {
     pub alpha: f64,
     /// Whether the test passed (no leak detected at this alpha).
     pub passed: bool,
-    /// Per-quantile thresholds used (for debugging).
-    pub thresholds: [f64; 9],
-    /// Per-quantile observed differences.
+    /// Bootstrap threshold for max statistic (single value).
+    pub threshold: f64,
+    /// Observed max|Δ_p| statistic.
+    pub max_observed: f64,
+    /// Per-quantile observed differences (for diagnostics).
     pub observed: [f64; 9],
 }
 
@@ -191,4 +202,215 @@ pub struct Metadata {
     pub batching: BatchingInfo,
     /// Total runtime in seconds.
     pub runtime_secs: f64,
+}
+
+/// Diagnostic checks for result reliability (spec §2.8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Diagnostics {
+    /// Non-stationarity: ratio of inference to calibration variance.
+    /// Values 0.5-2.0 are normal; >5.0 indicates non-stationarity.
+    pub stationarity_ratio: f64,
+    /// True if stationarity ratio is within acceptable bounds (0.5-2.0).
+    pub stationarity_ok: bool,
+
+    /// Model fit: chi-squared statistic for residuals.
+    /// Should be approximately χ²₇ under correct model.
+    pub model_fit_chi2: f64,
+    /// True if chi² ≤ 18.5 (p > 0.01 under χ²₇).
+    pub model_fit_ok: bool,
+
+    /// Outlier rate for fixed class (fraction trimmed).
+    pub outlier_rate_fixed: f64,
+    /// Outlier rate for random class (fraction trimmed).
+    pub outlier_rate_random: f64,
+    /// True if outlier rates are symmetric (both <1%, ratio <3×, diff <2%).
+    pub outlier_asymmetry_ok: bool,
+
+    /// Human-readable warnings (empty if all checks pass).
+    pub warnings: Vec<String>,
+}
+
+impl Diagnostics {
+    /// Create diagnostics indicating all checks passed.
+    pub fn all_ok() -> Self {
+        Self {
+            stationarity_ratio: 1.0,
+            stationarity_ok: true,
+            model_fit_chi2: 0.0,
+            model_fit_ok: true,
+            outlier_rate_fixed: 0.0,
+            outlier_rate_random: 0.0,
+            outlier_asymmetry_ok: true,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Check if all diagnostics are OK.
+    pub fn all_checks_passed(&self) -> bool {
+        self.stationarity_ok && self.model_fit_ok && self.outlier_asymmetry_ok
+    }
+}
+
+// ============================================================================
+// Outcome and Reliability Handling
+// ============================================================================
+
+/// Top-level outcome of a timing test.
+///
+/// Distinguishes between successful analysis and unmeasurable operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Outcome {
+    /// Analysis completed successfully.
+    Completed(TestResult),
+
+    /// Operation too fast to measure reliably on this platform.
+    Unmeasurable {
+        /// Estimated operation duration in nanoseconds.
+        operation_ns: f64,
+        /// Minimum measurable duration on this platform.
+        threshold_ns: f64,
+        /// Platform description (e.g., "Apple Silicon (cntvct)").
+        platform: String,
+        /// Suggested actions.
+        recommendation: String,
+    },
+}
+
+impl Outcome {
+    /// Check if the measurement is reliable enough for assertions.
+    ///
+    /// Returns `true` if:
+    /// - Test completed successfully, AND
+    /// - MDE is valid (> 0.01ns, indicating timer can resolve operations), AND
+    /// - Either quality is acceptable, OR posterior is conclusive (< 0.1 or > 0.9)
+    ///
+    /// The key insight: a conclusive posterior (near 0% or 100%) is trustworthy
+    /// even with noisy measurements—the signal overcame the noise. Only unreliable
+    /// when noise prevents reaching any conclusion.
+    ///
+    /// However, if MDE is 0.0 or very small, this indicates timer resolution failure
+    /// (most samples identical), making any posterior meaningless regardless of value.
+    pub fn is_reliable(&self) -> bool {
+        match self {
+            Outcome::Unmeasurable { .. } => false,
+            Outcome::Completed(result) => {
+                // MDE of 0.0 or very small indicates timer resolution failure
+                // In this case, even "conclusive" posteriors are meaningless garbage
+                let mde_valid = result.min_detectable_effect.shift_ns > 0.01
+                    && result.min_detectable_effect.shift_ns.is_finite();
+
+                if !mde_valid {
+                    return false;
+                }
+
+                // Conclusive posteriors are trustworthy even if noisy
+                result.leak_probability < 0.1
+                    || result.leak_probability > 0.9
+                    || result.quality != MeasurementQuality::TooNoisy
+            }
+        }
+    }
+
+    /// Handle unreliable measurements according to policy.
+    ///
+    /// - `FailOpen`: logs `[SKIPPED]` message, returns `None`
+    /// - `FailClosed`: panics with error message
+    ///
+    /// Returns `Some(result)` if measurement is reliable.
+    pub fn handle_unreliable(
+        self,
+        test_name: &str,
+        policy: UnreliablePolicy,
+    ) -> Option<TestResult> {
+        if self.is_reliable() {
+            return Some(self.unwrap_completed());
+        }
+
+        // Format message based on Outcome variant
+        let message = match &self {
+            Outcome::Unmeasurable {
+                operation_ns,
+                threshold_ns,
+                platform,
+                ..
+            } => {
+                format!(
+                    "unmeasurable: ~{:.0}ns operation, {:.0}ns threshold ({})",
+                    operation_ns, threshold_ns, platform
+                )
+            }
+            Outcome::Completed(result) => {
+                format!(
+                    "inconclusive: P(leak)={:.0}%, MDE={:.1}ns shift/{:.1}ns tail",
+                    result.leak_probability * 100.0,
+                    result.min_detectable_effect.shift_ns,
+                    result.min_detectable_effect.tail_ns
+                )
+            }
+        };
+
+        match policy {
+            UnreliablePolicy::FailOpen => {
+                eprintln!("[SKIPPED] {}: {}", test_name, message);
+                None
+            }
+            UnreliablePolicy::FailClosed => {
+                panic!("[UNRELIABLE] {}: {}", test_name, message);
+            }
+        }
+    }
+
+    /// Unwrap a completed result, panicking if unmeasurable.
+    pub fn unwrap_completed(self) -> TestResult {
+        match self {
+            Outcome::Completed(result) => result,
+            Outcome::Unmeasurable { platform, .. } => {
+                panic!("Test was unmeasurable on {}", platform)
+            }
+        }
+    }
+
+    /// Returns the result if completed, `None` if unmeasurable.
+    pub fn completed(self) -> Option<TestResult> {
+        match self {
+            Outcome::Completed(result) => Some(result),
+            Outcome::Unmeasurable { .. } => None,
+        }
+    }
+}
+
+/// Policy for handling unreliable measurements in test assertions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnreliablePolicy {
+    /// Log warning and skip assertions. Test passes.
+    /// Use when: noisy CI, parallel tests, "some coverage is better than none".
+    #[default]
+    FailOpen,
+
+    /// Panic. Test fails.
+    /// Use when: security-critical code, dedicated quiet CI runners.
+    FailClosed,
+}
+
+impl UnreliablePolicy {
+    /// Get policy from environment, with fallback default.
+    ///
+    /// Reads `TIMING_ORACLE_UNRELIABLE_POLICY` environment variable:
+    /// - `"fail_open"` → `FailOpen`
+    /// - `"fail_closed"` → `FailClosed`
+    /// - anything else → `default`
+    pub fn from_env_or(default: Self) -> Self {
+        match std::env::var("TIMING_ORACLE_UNRELIABLE_POLICY").as_deref() {
+            Ok("fail_open") => UnreliablePolicy::FailOpen,
+            Ok("fail_closed") => UnreliablePolicy::FailClosed,
+            _ => default,
+        }
+    }
+}
+
+impl TestResult {
+    /// Returns true if the test could detect effects of the given size.
+    pub fn can_detect(&self, effect_ns: f64) -> bool {
+        self.min_detectable_effect.shift_ns <= effect_ns
+    }
 }

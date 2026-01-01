@@ -8,8 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use std::hash::Hash;
+
+use crate::helpers::InputPair;
+use crate::result::{Outcome, TestResult, UnmeasurableInfo};
 use crate::{Config, TimingOracle};
-use crate::result::{TestResult, UnmeasurableInfo};
 
 /// Preset modes for CI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,21 +229,30 @@ impl CiTestBuilder {
     }
 
     /// Run the timing test and return result.
-    pub fn run<F, R, T>(self, fixed: F, random: R) -> Result<TestResult, CiFailure>
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - An `InputPair` containing baseline and sample generators
+    /// * `operation` - The operation to time (receives a reference to input)
+    pub fn run<T, F1, F2, F>(self, inputs: InputPair<T, F1, F2>, operation: F) -> Result<TestResult, CiFailure>
     where
-        F: FnMut() -> T,
-        R: FnMut() -> T,
+        T: Clone + Hash,
+        F1: FnMut() -> T,
+        F2: FnMut() -> T,
+        F: FnMut(&T),
     {
-        self.run_with_context(fixed, random).map(|outcome| outcome.result)
+        self.run_with_context(inputs, operation).map(|outcome| outcome.result)
     }
 
     /// Run and panic on failure, printing a concise summary and optionally writing a report.
-    pub fn unwrap_or_report<F, R, T>(self, fixed: F, random: R) -> TestResult
+    pub fn unwrap_or_report<T, F1, F2, F>(self, inputs: InputPair<T, F1, F2>, operation: F) -> TestResult
     where
-        F: FnMut() -> T,
-        R: FnMut() -> T,
+        T: Clone + Hash,
+        F1: FnMut() -> T,
+        F2: FnMut() -> T,
+        F: FnMut(&T),
     {
-        match self.run_with_context(fixed, random) {
+        match self.run_with_context(inputs, operation) {
             Ok(outcome) => {
                 print_summary(&outcome, /*failed=*/ false);
                 outcome.result
@@ -265,14 +277,16 @@ impl CiTestBuilder {
         }
     }
 
-    fn run_with_context<F, R, T>(
+    fn run_with_context<T, F1, F2, F>(
         self,
-        fixed: F,
-        random: R,
+        inputs: InputPair<T, F1, F2>,
+        operation: F,
     ) -> Result<CiRunOutcome, CiFailure>
     where
-        F: FnMut() -> T,
-        R: FnMut() -> T,
+        T: Clone + Hash,
+        F1: FnMut() -> T,
+        F2: FnMut() -> T,
+        F: FnMut(&T),
     {
         let CiTestBuilder {
             oracle,
@@ -291,7 +305,17 @@ impl CiTestBuilder {
         let report_path = compute_report_path(report_path.as_ref());
         let config_snapshot = oracle.config().clone();
 
-        let result = oracle.test(fixed, random);
+        let outcome_result = oracle.test(inputs, operation);
+        let result = match outcome_result {
+            Outcome::Completed(r) => r,
+            Outcome::Unmeasurable { operation_ns, threshold_ns, platform, recommendation } => {
+                return Err(CiFailure::Measurement(format!(
+                    "Operation too fast to measure: {:.1}ns (threshold: {:.1}ns on {}). {}",
+                    operation_ns, threshold_ns, platform, recommendation
+                )));
+            }
+        };
+
         let outcome = CiRunOutcome {
             report_path,
             result,

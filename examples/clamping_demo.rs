@@ -11,22 +11,16 @@ fn main() {
     println!("Demonstrating probability clamping\n");
 
     // Create an EXTREMELY obvious timing leak (1ms vs 0ms)
-    let inputs = InputPair::new(true, || false);
+    let inputs = InputPair::new(|| true, || false);
 
     let result = TimingOracle::quick()
-        .test(
-            || {
-                if *inputs.fixed() {
-                    // Extremely obvious delay
-                    thread::sleep(Duration::from_micros(100));
-                }
-            },
-            || {
-                if *inputs.random() {
-                    thread::sleep(Duration::from_micros(100));
-                }
-            },
-        );
+        .test(inputs, |input| {
+            if *input {
+                // Extremely obvious delay
+                thread::sleep(Duration::from_micros(100));
+            }
+        })
+        .unwrap_completed();
 
     println!("Results for obvious timing leak (100μs difference):");
     println!("  Leak probability: {:.2}%", result.leak_probability * 100.0);

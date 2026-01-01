@@ -111,6 +111,7 @@ fn format_pattern(pattern: EffectPattern) -> &'static str {
         EffectPattern::UniformShift => "UniformShift",
         EffectPattern::TailEffect => "TailEffect",
         EffectPattern::Mixed => "Mixed",
+        EffectPattern::Indeterminate => "Indeterminate",
     }
 }
 
@@ -138,11 +139,12 @@ fn exploitability_lines(exploit: Exploitability) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::result::{CiGate, Effect, Metadata, MinDetectableEffect};
+    use crate::result::{CiGate, Diagnostics, Effect, Metadata, MinDetectableEffect};
 
     fn make_test_result(passed: bool, leak_probability: f64) -> TestResult {
         TestResult {
             leak_probability,
+            bayes_factor: if leak_probability > 0.5 { 10.0 } else { 0.1 },
             effect: if leak_probability > 0.5 {
                 Some(Effect {
                     shift_ns: 150.0,
@@ -161,11 +163,13 @@ mod tests {
             ci_gate: CiGate {
                 alpha: 0.001,
                 passed,
-                thresholds: [0.0; 9],
+                threshold: 0.0,
+                max_observed: 0.0,
                 observed: [0.0; 9],
             },
             quality: MeasurementQuality::Good,
             outlier_fraction: 0.02,
+            diagnostics: Diagnostics::all_ok(),
             metadata: Metadata {
                 samples_per_class: 10000,
                 cycles_per_ns: 3.0,

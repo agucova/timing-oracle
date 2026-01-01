@@ -44,25 +44,17 @@ fn x25519_scalar_mult_constant_time() {
 
     // Pre-generate inputs using InputPair helper
     const SAMPLES: usize = 50_000;
-    let scalars = InputPair::with_samples(SAMPLES, fixed_scalar, rand_bytes_32);
+    let scalars = InputPair::new(|| fixed_scalar, rand_bytes_32);
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
         .ci_alpha(0.01)
-        .test(
-            || {
-                // DudeCT Class 0: Fixed scalar
-                let scalar = *scalars.fixed();
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-            || {
-                // DudeCT Class 1: Random scalar
-                let scalar = *scalars.random();
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-        );
+        .test(scalars, |scalar| {
+            let result = x25519(*scalar, basepoint);
+            std::hint::black_box(result);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[x25519_scalar_mult_constant_time]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -87,18 +79,21 @@ fn x25519_different_basepoints_constant_time() {
     // Basepoint 1: Random
     let basepoint_random = rand_bytes_32();
 
-    let result = TimingOracle::new()
+    let inputs = InputPair::new(|| 0, || 1);
+
+    let outcome = TimingOracle::new()
         .samples(30_000)
-        .test(
-            || {
-                let result = x25519(scalar, basepoint_zeros);
-                std::hint::black_box(result)
-            },
-            || {
-                let result = x25519(scalar, basepoint_random);
-                std::hint::black_box(result)
-            },
-        );
+        .test(inputs, |bp_idx| {
+            let basepoint = if *bp_idx == 0 {
+                basepoint_zeros
+            } else {
+                basepoint_random
+            };
+            let result = x25519(scalar, basepoint);
+            std::hint::black_box(result);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[x25519_different_basepoints_constant_time]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -137,36 +132,23 @@ fn x25519_multiple_operations_constant_time() {
 
     // Pre-generate inputs using InputPair - 3 scalars per sample
     const SAMPLES: usize = 10_000;
-    let scalars = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let scalars = InputPair::new(
         || fixed_scalars,
         || [rand_bytes_32(), rand_bytes_32(), rand_bytes_32()],
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // DudeCT Class 0: 3 operations with fixed scalars
-                let scalar_set = scalars.fixed();
-                let mut total = 0u8;
-                for scalar in scalar_set {
-                    let result = x25519(*scalar, basepoint);
-                    total ^= result[0];
-                }
-                std::hint::black_box(total)
-            },
-            || {
-                // DudeCT Class 1: 3 operations with random scalars
-                let scalar_set = scalars.random();
-                let mut total = 0u8;
-                for scalar in scalar_set {
-                    let result = x25519(*scalar, basepoint);
-                    total ^= result[0];
-                }
-                std::hint::black_box(total)
-            },
-        );
+        .test(scalars, |scalar_set| {
+            let mut total = 0u8;
+            for scalar in scalar_set {
+                let result = x25519(*scalar, basepoint);
+                total ^= result[0];
+            }
+            std::hint::black_box(total);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[x25519_multiple_operations_constant_time]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -196,8 +178,7 @@ fn x25519_scalar_clamping_constant_time() {
 
     // Pre-generate inputs using InputPair - both pre-clamped
     const SAMPLES: usize = 20_000;
-    let scalars = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let scalars = InputPair::new(
         || {
             // Pre-clamp fixed scalar
             let mut scalar = base_fixed_scalar;
@@ -216,22 +197,14 @@ fn x25519_scalar_clamping_constant_time() {
         },
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // DudeCT Class 0: Fixed scalar (pre-clamped)
-                let scalar = *scalars.fixed();
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-            || {
-                // DudeCT Class 1: Random scalar (pre-clamped)
-                let scalar = *scalars.random();
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-        );
+        .test(scalars, |scalar| {
+            let result = x25519(*scalar, basepoint);
+            std::hint::black_box(result);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[x25519_scalar_clamping_constant_time]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -248,22 +221,16 @@ fn x25519_scalar_clamping_constant_time() {
 fn x25519_hamming_weight_independence() {
     let basepoint = x25519_dalek::X25519_BASEPOINT_BYTES;
 
-    let result = TimingOracle::new()
+    let inputs = InputPair::new(|| [0x00u8; 32], || [0xFFu8; 32]);
+
+    let outcome = TimingOracle::new()
         .samples(20_000)
-        .test(
-            || {
-                // Low Hamming weight: mostly zeros
-                let scalar = [0x00u8; 32];
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-            || {
-                // High Hamming weight: all ones
-                let scalar = [0xFFu8; 32];
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-        );
+        .test(inputs, |scalar| {
+            let result = x25519(*scalar, basepoint);
+            std::hint::black_box(result);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[x25519_hamming_weight_independence]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -284,28 +251,28 @@ fn x25519_hamming_weight_independence() {
 fn x25519_byte_pattern_independence() {
     let basepoint = x25519_dalek::X25519_BASEPOINT_BYTES;
 
-    let result = TimingOracle::new()
+    let inputs = InputPair::new(|| 0u8, || 1u8);
+
+    let outcome = TimingOracle::new()
         .samples(20_000)
-        .test(
-            || {
+        .test(inputs, |pattern_type| {
+            let mut scalar = [0u8; 32];
+            if *pattern_type == 0 {
                 // Sequential pattern
-                let mut scalar = [0u8; 32];
                 for i in 0..32 {
                     scalar[i] = i as u8;
                 }
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-            || {
+            } else {
                 // Scattered pattern (reverse)
-                let mut scalar = [0u8; 32];
                 for i in 0..32 {
                     scalar[i] = (31 - i) as u8;
                 }
-                let result = x25519(scalar, basepoint);
-                std::hint::black_box(result)
-            },
-        );
+            }
+            let result = x25519(scalar, basepoint);
+            std::hint::black_box(result);
+        });
+
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[x25519_byte_pattern_independence]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
@@ -332,32 +299,20 @@ fn x25519_ecdh_exchange_constant_time() {
 
     // Pre-generate inputs using InputPair - scalar and public key per sample
     const SAMPLES: usize = 15_000;
-    let inputs = InputPair::from_fn_with_samples(
-        SAMPLES,
+    let inputs = InputPair::new(
         || (fixed_scalar, fixed_pubkey),
         || (rand_bytes_32(), rand_bytes_32()),
     );
 
-    let result = TimingOracle::new()
+    let outcome = TimingOracle::new()
         .samples(SAMPLES)
-        .test(
-            || {
-                // DudeCT Class 0: Fixed scalar and public key
-                let (secret_scalar, other_public_key) = *inputs.fixed();
+        .test(inputs, |(secret_scalar, other_public_key)| {
+            // Perform scalar multiplication (ECDH)
+            let shared = x25519(*secret_scalar, *other_public_key);
+            std::hint::black_box(shared);
+        });
 
-                // Perform scalar multiplication (ECDH)
-                let shared = x25519(secret_scalar, other_public_key);
-                std::hint::black_box(shared)
-            },
-            || {
-                // DudeCT Class 1: Random scalars and public keys
-                let (secret_scalar, other_public_key) = *inputs.random();
-
-                // Perform scalar multiplication (ECDH)
-                let shared = x25519(secret_scalar, other_public_key);
-                std::hint::black_box(shared)
-            },
-        );
+    let result = outcome.unwrap_completed();
 
     eprintln!("\n[x25519_ecdh_exchange_constant_time]");
     eprintln!("{}", timing_oracle::output::format_result(&result));
